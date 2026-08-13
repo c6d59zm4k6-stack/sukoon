@@ -15,6 +15,9 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Invalid request." });
     }
 
+    console.log("GROQ KEY EXISTS:", !!apiKey);
+    console.log("ABOUT TO CALL GROQ");
+    
     const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
