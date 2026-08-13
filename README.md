@@ -64,6 +64,6 @@ For a normal GitHub/Vercel deployment, those calls will fail harmlessly because 
 
 For a first prototype, that is intentional: get the Groq conversation loop working first.
 
-## Debug build
-This build temporarily surfaces API failures in the chat as `DEBUG: ...`.
-Use it only to diagnose the Vercel/Groq connection. Do not use this build as the production version.
+
+## Diagnostic build
+This temporary build surfaces the exact Groq/Vercel stage and HTTP error when an AI call fails. Replace with the normal build after diagnosis.
