@@ -63,3 +63,7 @@ The current memory and MI aggregate code uses `window.storage`, which is availab
 For a normal GitHub/Vercel deployment, those calls will fail harmlessly because the code already wraps them in `try/catch`. The chat itself will work, but persistent Memory and all-time MI metrics will not persist across page reloads unless a storage backend is added.
 
 For a first prototype, that is intentional: get the Groq conversation loop working first.
+
+## Debug build
+This build temporarily surfaces API failures in the chat as `DEBUG: ...`.
+Use it only to diagnose the Vercel/Groq connection. Do not use this build as the production version.
