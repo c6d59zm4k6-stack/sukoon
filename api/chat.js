@@ -15,9 +15,6 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Invalid request." });
     }
 
-    console.log("GROQ KEY EXISTS:", !!apiKey);
-    console.log("ABOUT TO CALL GROQ");
-    
     const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -25,7 +22,7 @@ export default async function handler(req, res) {
         "Authorization": `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: model || "llama-3.3-70b-versatile",
+        model: model || "openai/gpt-oss-120b",
         messages: [
           { role: "system", content: system },
           ...messages.map(m => ({
@@ -34,7 +31,8 @@ export default async function handler(req, res) {
           }))
         ],
         max_tokens: Math.min(Number(max_tokens) || 1000, 2000),
-        temperature: 0.7
+        temperature: 0.7,
+        response_format: { type: "json_object" }
       })
     });
 
