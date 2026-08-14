@@ -37,7 +37,15 @@ export default async function handler(req, res) {
         // no call in this app legitimately needs more than that.
         max_tokens: Math.min(Number(max_tokens) || 300, 800),
         temperature: 0.7,
-        response_format: { type: "json_object" }
+        response_format: { type: "json_object" },
+        // gpt-oss models are reasoning models — by default they spend hidden
+        // chain-of-thought tokens (medium effort) before the visible JSON answer,
+        // and those tokens count against max_tokens. At the tighter budgets we
+        // now use per call, that was eating the whole budget and leaving no room
+        // to finish the JSON, causing Groq's json_object validator to 400 with
+        // "Failed to generate JSON". Low effort is enough for short, simple
+        // classification/reply tasks like this app's.
+        ...(String(model || "openai/gpt-oss-120b").includes("gpt-oss") ? { reasoning_effort: "low" } : {})
       })
     });
 
