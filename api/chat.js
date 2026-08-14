@@ -9,7 +9,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { system, messages, model, max_tokens } = req.body || {};
+    const { system, messages, model, max_tokens, plain_text } = req.body || {};
 
     if (!system || !Array.isArray(messages)) {
       return res.status(400).json({ error: "Invalid request." });
@@ -37,7 +37,14 @@ export default async function handler(req, res) {
         // no call in this app legitimately needs more than that.
         max_tokens: Math.min(Number(max_tokens) || 300, 800),
         temperature: 0.7,
-        response_format: { type: "json_object" },
+        // json_object mode has been the source of every observed "Failed to generate/
+        // validate JSON" 400 — and only ever on the main/retry reply call, never on
+        // classify/evaluator/coder/memory. Rather than keep tuning that mode, main/
+        // retry now skip it entirely (plain_text:true) and use a simple delimited
+        // text format parsed client-side, which Groq can't reject as invalid JSON
+        // because no JSON is being requested. Other stages keep json_object — their
+        // simpler shapes haven't shown this failure.
+        ...(plain_text ? {} : { response_format: { type: "json_object" } }),
         // gpt-oss models are reasoning models — by default they spend hidden
         // chain-of-thought tokens (medium effort) before the visible answer,
         // and those tokens count against max_tokens. Low effort keeps more of
