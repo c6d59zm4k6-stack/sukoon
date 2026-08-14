@@ -30,7 +30,12 @@ export default async function handler(req, res) {
             content: String(m.content || "")
           }))
         ],
-        max_tokens: Math.min(Number(max_tokens) || 1000, 2000),
+        // Was: Math.min(Number(max_tokens) || 1000, 2000) — every call defaulted to
+        // requesting up to 1000 output tokens even for a 10-token JSON classifier reply.
+        // Front end now always sends an explicit, right-sized max_tokens; 300 is just a
+        // safety-net default if it ever doesn't, and the ceiling is lowered to 800 since
+        // no call in this app legitimately needs more than that.
+        max_tokens: Math.min(Number(max_tokens) || 300, 800),
         temperature: 0.7,
         response_format: { type: "json_object" }
       })
@@ -40,8 +45,11 @@ export default async function handler(req, res) {
 
     if (!groqResponse.ok) {
       console.error("Groq API error:", data);
+      // Surface Retry-After so the client can back off intelligently on 429s.
+      const retryAfter = groqResponse.headers.get("retry-after");
       return res.status(groqResponse.status).json({
-        error: data?.error?.message || "Groq request failed."
+        error: data?.error?.message || "Groq request failed.",
+        retryAfter: retryAfter ? Number(retryAfter) : null
       });
     }
 
