@@ -70,17 +70,40 @@ function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 // against the same per-minute budget as prompt tokens.
 const TOKEN_BUDGETS={classifier:150,evaluator:120,coder:100,memory:200,main:450,retry:450};
 
+// Strict JSON schemas per call stage — required for Groq's constrained-decoding
+// structured output mode (response_format: json_schema, strict:true). This is what
+// actually stops "Failed to generate JSON" errors: the model is constrained at the
+// token level to only produce output matching these shapes, instead of the old
+// json_object mode which was only best-effort. Every object needs additionalProperties:false
+// and every property listed in required, per Groq's structured-outputs spec.
+const SCHEMAS={
+  classifier:{type:"object",properties:{risk:{type:"string",enum:["none","crisis","elevated_distress"]},scope:{type:"string",enum:["in_scope","medical_advice_seeking","diagnosis_seeking","unrelated_task","confused_by_question"]}},required:["risk","scope"],additionalProperties:false},
+  evaluator:{type:"object",properties:{pass:{type:"boolean"},issue:{anyOf:[{type:"null"},{type:"string",enum:["unsolicited_advice","diagnosis_language","medication_mention","low_empathy","out_of_scope","parasocial_overclaim","unearned_complex_reflection"]}]}},required:["pass","issue"],additionalProperties:false},
+  coder:{type:"object",properties:{codes:{type:"array",items:{type:"string",enum:["simple_reflection","complex_reflection","open_question","closed_question","advice","other"]}}},required:["codes"],additionalProperties:false},
+  memory:{type:"object",properties:{notes:{type:"array",items:{type:"string"}}},required:["notes"],additionalProperties:false},
+  reply:{type:"object",properties:{reply:{type:"string"},quick_replies:{type:"array",items:{type:"string"}}},required:["reply","quick_replies"],additionalProperties:false}
+};
+const SCHEMA_BY_STAGE={classifier:SCHEMAS.classifier,evaluator:SCHEMAS.evaluator,coder:SCHEMAS.coder,memory:SCHEMAS.memory,main:SCHEMAS.reply,retry:SCHEMAS.reply};
+
 async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
   let response;
   try {
-    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:GROQ_MODEL,max_tokens:budget})});
+    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:GROQ_MODEL,max_tokens:budget,response_schema:SCHEMA_BY_STAGE[stage]||null,schema_name:stage||"response"})});
   } catch(e) {
     throw new Error((stage||"AI") + " network error: " + (e && e.message ? e.message : String(e)));
   }
   let data;
   try { data=await response.json(); } catch(e) {
     throw new Error((stage||"AI") + " returned non-JSON HTTP " + response.status);
+  }
+  if(response.status===400 && !_isRetryAttempt && /failed to generate json/i.test((data&&data.error)||"")){
+    // Even with strict schema mode, Groq's community forum documents occasional
+    // model-side generation misses on gpt-oss-120b. This is a known, transient
+    // class of failure, not a bad prompt — retry once before giving up.
+    console.warn("[Sukoon]",stage,"hit a JSON-generation miss, retrying once");
+    await sleep(1200);
+    return callGroq(systemPrompt,messages,stage,maxTokens,true);
   }
   if(response.status===429 && !_isRetryAttempt){
     // Transient TPM rate limit — back off once and retry, instead of failing straight
