@@ -96,6 +96,7 @@ const TOKEN_BUDGETS={classifier:150,evaluator:120,coder:100,memory:200,main:450,
 
 async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
+  const _t0=performance.now();
   let response;
   try {
     response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:SELECTED_MODEL,max_tokens:budget,plain_text:(stage==="main"||stage==="retry"),reasoning_effort:currentModelConfig().reasoning,session_id:SESSION_ID})});
@@ -123,6 +124,7 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
   }
   if(!response.ok) throw new Error((stage||"AI") + " HTTP " + response.status + ": " + (data.error||JSON.stringify(data)));
   if(!data.text) throw new Error((stage||"AI") + " returned empty text");
+  console.log("[Sukoon] TIMING",stage,"took",Math.round(performance.now()-_t0),"ms");
   return data.text;
 }
 const MAX_REPLY_WORDS=70,MAX_READING_GRADE=5.4;
