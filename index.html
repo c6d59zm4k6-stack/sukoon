@@ -28,6 +28,7 @@
   .metric-block{margin-bottom:14px}.metric-block h4{margin:0 0 6px;font-size:.8rem;text-transform:uppercase;letter-spacing:.5px;color:var(--ink-soft);font-weight:600}.metric-row{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--mist);border-radius:8px;margin-bottom:4px;font-size:.82rem}.metric-row .val{font-variant-numeric:tabular-nums;font-weight:600}.status{font-size:.7rem;padding:2px 7px;border-radius:10px;margin-left:6px}.status.ok{background:var(--sage-soft);color:#3E5347}.status.off{background:var(--clay-soft);color:#7A3F2E}.status.na{background:var(--border);color:var(--ink-soft)}.metric-note{font-size:.72rem;color:var(--ink-soft);margin:6px 0 0;line-height:1.4}.btn{flex:1;border:none;border-radius:12px;padding:10px;font-size:.85rem;cursor:pointer;font-family:'Work Sans',sans-serif;font-weight:500}.btn-ghost{background:var(--mist);color:var(--ink)}.btn-danger{background:var(--clay-soft);color:#7A3F2E}.btn-primary{background:var(--marigold);color:var(--indigo-deep)}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
   #model-select{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.72rem;font-family:'Work Sans',sans-serif;padding:7px 9px;border-radius:20px;cursor:pointer;max-width:120px}
   #model-select option{color:var(--ink);background:#fff}
+  .bubble.filler{opacity:.6;font-style:italic}
 </style>
 </head>
 <body>
@@ -47,7 +48,7 @@ import { buildConversationPrompt } from "./conversation/prompt.js";
 const MODEL_OPTIONS = [
   { id: "anthropic/claude-sonnet-5",    label: "Claude Sonnet 5",     reasoning: null  },
   { id: "qwen/qwen3.8-2.4t-a95b",       label: "Qwen3.8 2.4T A95B",   reasoning: "low" },
-  { id: "deepseek/deepseek-v4-flash",   label: "DeepSeek V4 Flash",   reasoning: null  },
+  { id: "deepseek/deepseek-v4-flash",   label: "DeepSeek V4 Flash",   reasoning: null, disableThinking: true },
   { id: "z-ai/glm-5.2",                 label: "GLM-5.2",             reasoning: null  },
   { id: "deepseek/deepseek-v4-pro",     label: "DeepSeek V4 Pro",     reasoning: null  },
   { id: "moonshotai/kimi-k2.6",         label: "Kimi K2.6",           reasoning: null  },
@@ -99,7 +100,7 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
   const _t0=performance.now();
   let response;
   try {
-    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:SELECTED_MODEL,max_tokens:budget,plain_text:(stage==="main"||stage==="retry"),reasoning_effort:currentModelConfig().reasoning,session_id:SESSION_ID})});
+    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:SELECTED_MODEL,max_tokens:budget,plain_text:(stage==="main"||stage==="retry"),reasoning_effort:currentModelConfig().reasoning,session_id:SESSION_ID,disable_thinking:!!currentModelConfig().disableThinking})});
   } catch(e) {
     throw new Error((stage||"AI") + " network error: " + (e && e.message ? e.message : String(e)));
   }
@@ -172,6 +173,41 @@ let lastFallbackText=null;
 function pickFallbackReply(){const pool=SAFE_FALLBACK_REPLIES.filter(r=>r!==lastFallbackText);const choice=pool[Math.floor(Math.random()*pool.length)];lastFallbackText=choice;return choice}
 const EXTRACT_SYSTEM="Extract 1-3 short factual memory notes from this conversation that would help a supportive, non-clinical companion continue naturally in a future session. Each note under 12 words, factual. Do NOT include self-harm, suicide, or crisis content. Respond ONLY with compact JSON: {\"notes\":[\"...\",\"...\"]}";
 async function extractMemory(){if(!memoryEnabled)return;const recent=history.slice(-10);if(recent.length<2)return;try{const raw=await callGroq(EXTRACT_SYSTEM,recent,"memory");const parsed=safeParseJSON(raw);const notes=parsed&&Array.isArray(parsed.notes)?parsed.notes:null;if(notes&&notes.length){memoryFacts=notes.concat(memoryFacts).filter((v,i,a)=>a.indexOf(v)===i).slice(0,12);await saveMemory(memoryFacts)}}catch(e){}}
+function parseCombinedReply(raw){
+  const riskMatch=raw.match(/RISK:\s*(none|elevated_distress|crisis)/i);
+  const scopeMatch=raw.match(/SCOPE:\s*(in_scope|medical_advice_seeking|diagnosis_seeking|unrelated_task|confused_by_question)/i);
+  const replyMatch=raw.match(/REPLY:\s*([\s\S]*?)(?:\n\s*QUICK_REPLIES:|$)/i);
+  const qrMatch=raw.match(/QUICK_REPLIES:\s*(.*)/i);
+  const reply=(replyMatch?replyMatch[1]:raw).trim();
+  let quick_replies=[];
+  if(qrMatch){
+    const qrText=qrMatch[1].trim();
+    if(qrText && !/^none$/i.test(qrText)){
+      quick_replies=qrText.split("|").map(s=>s.trim()).filter(Boolean);
+    }
+  }
+  // Defaults to the safe/normal case if parsing fails for any reason — same
+  // fail-open direction the old standalone classify() used on error.
+  return {
+    risk: riskMatch ? riskMatch[1].toLowerCase() : "none",
+    scope: scopeMatch ? scopeMatch[1].toLowerCase() : "in_scope",
+    reply: reply || raw.trim(),
+    quick_replies
+  };
+}
+// Short, throwaway asides shown while waiting — never sent to the model as real
+// conversation, never counted as part of history. Purely a UI nicety.
+const FILLER_REPLIES=["hmm.","mm.","yeah...","right...","mm, okay.","uh-huh.","yeah, go on."];
+function addFillerBubble(text){
+  const row=document.createElement("div");
+  row.className="bubble-row companion";
+  const bubble=document.createElement("div");
+  bubble.className="bubble filler";
+  bubble.textContent=text;
+  row.appendChild(bubble);
+  chatEl.appendChild(row);
+  scrollToBottom();
+}
 function parseReplyPlain(raw){
   const replyMatch=raw.match(/REPLY:\s*([\s\S]*?)(?:\n\s*QUICK_REPLIES:|$)/i);
   const qrMatch=raw.match(/QUICK_REPLIES:\s*(.*)/i);
@@ -187,22 +223,31 @@ function parseReplyPlain(raw){
 }
 // Keep safety/scope handling and local memory, but make the tested JSX prompt the
 // sole conversation policy used for main and retry replies.
-function buildCanonicalSystemPrompt(scopeDirective){
+function buildCanonicalSystemPrompt(contextNote){
   lastCandidateActivity=null;
   return buildConversationPrompt({
     memoryFacts: memoryEnabled ? memoryFacts.slice(0,5) : [],
-    scopeDirective
+    scopeDirective: contextNote
   });
 }
-async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();let classification={risk:"none",scope:"in_scope"};if(!opts.skipClassify){try{classification=await classify(text)}catch(e){}}
-if(classification.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
-if(classification.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
-let scopeDirective="";if(classification.scope==="medical_advice_seeking")scopeDirective="The person asked about medication/treatment. Explain that this is outside this chat and steer back to how they are feeling.";else if(classification.scope==="diagnosis_seeking")scopeDirective="The person asked for a diagnosis. Do not name or suggest one. Explain this is outside this chat and steer back to their experience.";else if(classification.scope==="unrelated_task")scopeDirective="The person asked for something unrelated to emotional support. Decline briefly and steer back to how they are doing.";else if(classification.scope==="confused_by_question")scopeDirective=consecutiveConfusionTurns>=2?"This is at least the second turn in a row where they've signaled confusion. Do NOT just reflect their confusion again — that reads as a stall, not support. Instead, pick ONE concrete thing they already told you earlier in this conversation and turn it into a single simple, closed, easy-to-answer next step (yes/no or a short choice) — give them something easy to respond to so the conversation can move again.":"The person just said they don't understand, or pushed back on, your last question or reflection. Do NOT ask another abstract or meta question about their confusion (never 'what feels unclear about it' or similar). Instead either: (a) drop the question entirely and just reflect back something concrete and simple in their own words, or (b) ask one very plain, concrete question tied directly to something specific they already told you — never ask them to define a feeling word or explain their own confusion.";else if(classification.risk==="elevated_distress")scopeDirective="The person seems in significant distress. Prioritize warmth and validation; don't suggest an activity.";
-if(classification.risk!=="elevated_distress"&&classification.scope==="in_scope")lastCandidateActivity=pickActivity(text,usedActivityIds);else lastCandidateActivity=null;
-try{const systemPrompt=buildCanonicalSystemPrompt(scopeDirective);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseReplyPlain(raw);console.log("[Sukoon] parsed reply:",parsed);let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
+async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();
+// Occasionally shows a quick "hmm." / "yeah..." aside if the reply takes a moment —
+// not every turn (45% chance), and only if it's still waiting 1.3s in. Cancelled the
+// instant a real response comes back, so it never trails behind or shows up stale.
+let fillerTimer=setTimeout(()=>{if(Math.random()<0.45){addFillerBubble(FILLER_REPLIES[Math.floor(Math.random()*FILLER_REPLIES.length)])}},1300);
+// Was: a separate classify() call before main, gating what main was told to do.
+// Now: main does its own risk/scope self-check as part of one combined call (see
+// prompt.js SELF-CHECK section) — cuts a full sequential round trip off every turn.
+// contextNote only carries prior-turn state the model can't infer on its own.
+const contextNote=consecutiveConfusionTurns>=1?("CONTEXT: they have signaled confusion about your last message "+consecutiveConfusionTurns+" time(s) in a row so far."):"";
+try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseCombinedReply(raw);console.log("[Sukoon] parsed reply:",parsed);clearTimeout(fillerTimer);
+if(parsed.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
+if(parsed.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
+lastCandidateActivity=(parsed.risk!=="elevated_distress"&&parsed.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
+let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
 if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply(),quick_replies:[]};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){parsed={reply:"DEBUG: retry failed — "+(e2&&e2.message?e2.message:String(e2)),quick_replies:[]}}}
 removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});addBubble("assistant",parsed.reply,chip,parsed.quick_replies);if(!isFallback)codeCompanionTurn(text,parsed.reply)
-}catch(e){removeTyping();const fallback="DEBUG: main flow failed — "+(e&&e.message?e.message:String(e));console.error("[Sukoon DEBUG]",e);history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
+}catch(e){clearTimeout(fillerTimer);removeTyping();const fallback="DEBUG: main flow failed — "+(e&&e.message?e.message:String(e));console.error("[Sukoon DEBUG]",e);history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
 function renderMemoryList(){memoryListEl.innerHTML="";if(!memoryFacts.length){memoryListEl.innerHTML="<p class='memory-empty'>Nothing saved yet — Sukoon remembers little things as you talk, so it's less repetitive next time.</p>";return}memoryFacts.forEach(f=>{const li=document.createElement("li");li.textContent=f;memoryListEl.appendChild(li)})}
