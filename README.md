@@ -51,18 +51,20 @@ Do not commit `.env.local`.
 
 ## Files
 
-- `index.html` — complete Sukoon UI and conversation logic
+- `index.html` — chat UI, safety flow, local session state, and rendering
 - `api/chat.js` — secure Groq proxy
+- `conversation/prompt.js` — canonical conversation prompt shared with the JSX testbench
+- `conversation/test-scenarios.js` — frozen multi-turn fixtures for prompt regression testing
 - `package.json` — minimal Vercel project configuration
 - `.gitignore` — prevents local secrets from being committed
 
 ## Important prototype note
 
-The current memory and MI aggregate code uses `window.storage`, which is available in the original Claude Artifact environment but is **not a standard browser API**.
+For the demo, factual memory and aggregate diagnostic metrics are stored in browser-local storage. They persist only in that browser and are not shared across devices or users.
 
-For a normal GitHub/Vercel deployment, those calls will fail harmlessly because the code already wraps them in `try/catch`. The chat itself will work, but persistent Memory and all-time MI metrics will not persist across page reloads unless a storage backend is added.
+The production conversation prompt is the same canonical prompt used by the question-sequencing testbench. The app retains its existing crisis routing, scope checks, reply evaluation, retry, and local-memory flow around that prompt.
 
-For a first prototype, that is intentional: get the Groq conversation loop working first.
+Run `npm run verify:conversation` to validate the canonical prompt structure and the frozen test scenarios after prompt changes.
 
 
 ## Diagnostic build
