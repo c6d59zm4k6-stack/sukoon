@@ -69,3 +69,21 @@ Run `npm run verify:conversation` to validate the canonical prompt structure and
 
 ## Diagnostic build
 This temporary build surfaces the exact Groq/Vercel stage and HTTP error when an AI call fails. Replace with the normal build after diagnosis.
+
+## Architecture
+```mermaid
+flowchart TD
+  UI["Browser UI<br/>index.html"] --> S["Conversation state<br/>history · asked questions · local memory"]
+  S --> CR["Fast crisis check"]
+  CR --> CL["Groq classifier<br/>risk + scope"]
+  CL --> PB["Prompt builder<br/>JSX canonical prompt + memory + safety directive"]
+  PB --> API["Vercel /api/chat<br/>GROQ_API_KEY stays server-side"]
+  API --> G["Groq: GPT-OSS 120B"]
+  G --> PR["Parse REPLY + QUICK_REPLIES"]
+  PR --> EV["Groq evaluator + deterministic checks"]
+  EV -->|pass| UI
+  EV -->|fail once| PB
+  EV -->|fail twice| FB["Safe fallback reply"]
+  UI --> MI["Diagnostic behavioural coding"]
+  UI --> MEM["Every 4 user turns:<br/>extract browser-local memory"]
+```
