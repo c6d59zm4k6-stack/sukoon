@@ -26,11 +26,13 @@
   .disclaimer{text-align:center;font-size:.68rem;color:var(--ink-soft);padding:3px 16px 10px;flex-shrink:0}
   .modal-overlay{position:absolute;inset:0;background:rgba(35,32,72,.45);display:none;align-items:center;justify-content:center;z-index:10;padding:20px}.modal-overlay.open{display:flex}.modal{background:#fff;border-radius:var(--radius);padding:20px;max-width:400px;width:100%;max-height:80vh;overflow-y:auto}.modal h2{font-family:'Fraunces',serif;font-weight:500;font-size:1.1rem;margin:0 0 4px}.modal .sub{font-size:.8rem;color:var(--ink-soft);margin:0 0 14px}.memory-list{list-style:none;padding:0;margin:0 0 16px;display:flex;flex-direction:column;gap:6px}.memory-list li{background:var(--mist);border-radius:10px;padding:8px 12px;font-size:.85rem}.memory-empty{font-size:.85rem;color:var(--ink-soft);font-style:italic}.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-top:1px solid var(--border);font-size:.85rem}.switch{position:relative;width:40px;height:22px;flex-shrink:0}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:var(--border);border-radius:22px;cursor:pointer;transition:.15s}.slider:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}input:checked+.slider{background:var(--sage)}input:checked+.slider:before{transform:translateX(18px)}.modal-actions{display:flex;gap:8px;margin-top:14px}
   .metric-block{margin-bottom:14px}.metric-block h4{margin:0 0 6px;font-size:.8rem;text-transform:uppercase;letter-spacing:.5px;color:var(--ink-soft);font-weight:600}.metric-row{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--mist);border-radius:8px;margin-bottom:4px;font-size:.82rem}.metric-row .val{font-variant-numeric:tabular-nums;font-weight:600}.status{font-size:.7rem;padding:2px 7px;border-radius:10px;margin-left:6px}.status.ok{background:var(--sage-soft);color:#3E5347}.status.off{background:var(--clay-soft);color:#7A3F2E}.status.na{background:var(--border);color:var(--ink-soft)}.metric-note{font-size:.72rem;color:var(--ink-soft);margin:6px 0 0;line-height:1.4}.btn{flex:1;border:none;border-radius:12px;padding:10px;font-size:.85rem;cursor:pointer;font-family:'Work Sans',sans-serif;font-weight:500}.btn-ghost{background:var(--mist);color:var(--ink)}.btn-danger{background:var(--clay-soft);color:#7A3F2E}.btn-primary{background:var(--marigold);color:var(--indigo-deep)}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+  #model-select{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.72rem;font-family:'Work Sans',sans-serif;padding:7px 9px;border-radius:20px;cursor:pointer;max-width:120px}
+  #model-select option{color:var(--ink);background:#fff}
 </style>
 </head>
 <body>
 <div class="app">
-<header><div class="orb"></div><div class="header-text"><h1>Sukoon</h1><p>a quiet companion, not a clinician</p></div><div class="header-actions"><button class="icon-btn" id="memory-btn" type="button">Memory</button><button class="icon-btn" id="help-btn" type="button">Need help now</button></div></header>
+<header><div class="orb"></div><div class="header-text"><h1>Sukoon</h1><p>a quiet companion, not a clinician</p></div><div class="header-actions"><select id="model-select" title="Test model"></select><button class="icon-btn" id="memory-btn" type="button">Memory</button><button class="icon-btn" id="help-btn" type="button">Need help now</button></div></header>
 <div class="chat" id="chat"></div>
 <div class="input-bar"><textarea id="composer" rows="1" placeholder="Say what's on your mind…"></textarea><button id="send-btn" type="button" aria-label="Send">➤</button></div>
 <p class="disclaimer">Sukoon offers supportive conversation only — it's not a substitute for professional care.</p>
@@ -39,7 +41,25 @@
 </div>
 <script type="module">
 import { buildConversationPrompt } from "./conversation/prompt.js";
-const GROQ_MODEL = "openai/gpt-oss-120b";
+// Editable via the header dropdown; persisted in localStorage so it survives reloads.
+// Every model here is called through OpenRouter with the same request shape, so
+// swapping models is just picking a different slug — no other code changes needed.
+const MODEL_OPTIONS = [
+  { id: "anthropic/claude-sonnet-5",    label: "Claude Sonnet 5",     reasoning: null  },
+  { id: "qwen/qwen3.8-2.4t-a95b",       label: "Qwen3.8 2.4T A95B",   reasoning: "low" },
+  { id: "deepseek/deepseek-v4-flash",   label: "DeepSeek V4 Flash",   reasoning: null  },
+  { id: "z-ai/glm-5.2",                 label: "GLM-5.2",             reasoning: null  },
+  { id: "deepseek/deepseek-v4-pro",     label: "DeepSeek V4 Pro",     reasoning: null  },
+  { id: "moonshotai/kimi-k2.6",         label: "Kimi K2.6",           reasoning: null  },
+  { id: "moonshotai/kimi-k3",           label: "Kimi K3",             reasoning: "low" },
+  { id: "qwen/qwen3.6-plus",            label: "Qwen3.6 Plus",        reasoning: null  },
+  { id: "anthropic/claude-opus-4.8",    label: "Claude Opus 4.8",     reasoning: null  },
+  { id: "x-ai/grok-4.6",                label: "Grok 4.6",            reasoning: null  },
+];
+function loadSelectedModel(){return localStorage.getItem("sukoon_model")||MODEL_OPTIONS[0].id}
+function saveSelectedModel(id){try{localStorage.setItem("sukoon_model",id)}catch(e){}}
+let SELECTED_MODEL=loadSelectedModel();
+function currentModelConfig(){return MODEL_OPTIONS.find(m=>m.id===SELECTED_MODEL)||MODEL_OPTIONS[0]}
 // Max turns (user+assistant messages) sent to the model on the main/retry calls.
 // Was: full unbounded `history`, so token cost per call grew every turn all session.
 const HISTORY_WINDOW = 16;
@@ -75,7 +95,7 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
   let response;
   try {
-    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:GROQ_MODEL,max_tokens:budget,plain_text:(stage==="main"||stage==="retry")})});
+    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:SELECTED_MODEL,max_tokens:budget,plain_text:(stage==="main"||stage==="retry"),reasoning_effort:currentModelConfig().reasoning})});
   } catch(e) {
     throw new Error((stage||"AI") + " network error: " + (e && e.message ? e.message : String(e)));
   }
@@ -84,16 +104,15 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
     throw new Error((stage||"AI") + " returned non-JSON HTTP " + response.status);
   }
   if(response.status===400 && !_isRetryAttempt && /failed to (generate|validate) json/i.test((data&&data.error)||"")){
-    // Known occasional model-side miss on gpt-oss-120b's JSON mode, not a bad prompt —
+    // Known occasional model-side miss on strict JSON mode, not a bad prompt —
     // retry once, fast (this isn't a rate limit, no need for a long backoff).
     console.warn("[Sukoon]",stage,"hit a JSON-generation miss, retrying once");
     await sleep(400);
     return callGroq(systemPrompt,messages,stage,maxTokens,true);
   }
   if(response.status===429 && !_isRetryAttempt){
-    // Transient TPM rate limit — back off once and retry, instead of failing straight
-    // to the fallback/debug message. Groq's error body includes a "try again in Xs" hint;
-    // the API route also forwards a retry-after header when present.
+    // Transient rate limit — back off once and retry, instead of failing straight
+    // to the fallback/debug message. The API route forwards a retry-after header when present.
     const waitSec=Math.min(Math.max((data && data.retryAfter) || 6, 3),20);
     console.warn("[Sukoon]",stage,"hit 429, backing off",waitSec,"s before one retry");
     await sleep(waitSec*1000);
@@ -131,6 +150,10 @@ async function persistAggregate(codes){codes.forEach(c=>{if(c in aggregateTally)
 async function resetAggregate(){aggregateTally=emptyTally();aggregateSessions=0;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:0}))}catch(e){}renderDebugPanel()}
 let history=[],memoryFacts=[],memoryEnabled=true,usedActivityIds=new Set(),lastCandidateActivity=null,userTurnCount=0,askedQuestions=[],consecutiveConfusionTurns=0;
 const chatEl=document.getElementById("chat"),composer=document.getElementById("composer"),sendBtn=document.getElementById("send-btn"),helpBtn=document.getElementById("help-btn"),memoryBtn=document.getElementById("memory-btn"),memoryOverlay=document.getElementById("memory-overlay"),memoryListEl=document.getElementById("memory-list"),memoryToggle=document.getElementById("memory-toggle"),forgetBtn=document.getElementById("forget-btn"),closeMemoryBtn=document.getElementById("close-memory-btn");
+const modelSelectEl=document.getElementById("model-select");
+MODEL_OPTIONS.forEach(m=>{const opt=document.createElement("option");opt.value=m.id;opt.textContent=m.label;modelSelectEl.appendChild(opt)});
+modelSelectEl.value=SELECTED_MODEL;
+modelSelectEl.addEventListener("change",()=>{SELECTED_MODEL=modelSelectEl.value;saveSelectedModel(SELECTED_MODEL)});
 function scrollToBottom(){chatEl.scrollTop=chatEl.scrollHeight}function clearQuickReplyChips(){document.querySelectorAll(".quick-replies").forEach(el=>el.remove())}
 function addBubble(role,text,chipActivity,quickReplies){const row=document.createElement("div");row.className="bubble-row "+(role==="user"?"user":"companion");const bubble=document.createElement("div");bubble.className="bubble";bubble.textContent=text;row.appendChild(bubble);if(chipActivity){const chip=document.createElement("div");chip.className="chip";chip.title=chipActivity.desc;chip.innerHTML="🧭 Suggested: <b>"+chipActivity.title+"</b> · "+chipActivity.duration;row.appendChild(chip)}if(quickReplies&&quickReplies.length){const wrap=document.createElement("div");wrap.className="quick-replies";quickReplies.slice(0,3).forEach(qr=>{if(!qr||!qr.trim()||qr.includes("?"))return;const btn=document.createElement("button");btn.type="button";btn.className="quick-chip";btn.textContent=qr;btn.addEventListener("click",()=>sendMessage(qr,{skipClassify:true}));wrap.appendChild(btn)});row.appendChild(wrap)}chatEl.appendChild(row);scrollToBottom()}
 function addCrisisCard(){const row=document.createElement("div");row.className="bubble-row companion";const card=document.createElement("div");card.className="crisis-card";card.innerHTML="<h3>You don't have to go through this alone</h3><p>What you're feeling matters, and there are people ready to listen right now — free and confidential.</p><div class='lines'><div class='line'><strong>Tele-MANAS (24/7, govt. helpline)</strong><a href='tel:14416'>14416</a></div><div class='line'><strong>Vandrevala Foundation (24/7)</strong><a href='tel:+919999666555'>+91 9999 666 555</a></div></div><p class='close-note'>You can keep talking here too — I'm not going anywhere.</p>";row.appendChild(card);chatEl.appendChild(row);scrollToBottom()}
