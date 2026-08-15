@@ -7,7 +7,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "OPENROUTER_API_KEY is not configured." });
   }
   try {
-    const { system, messages, model, max_tokens, plain_text, reasoning_effort, session_id } = req.body || {};
+    const { system, messages, model, max_tokens, plain_text, reasoning_effort, session_id, disable_thinking } = req.body || {};
     if (!system || !Array.isArray(messages)) {
       return res.status(400).json({ error: "Invalid request." });
     }
@@ -56,6 +56,10 @@ export default async function handler(req, res) {
         ],
         max_tokens: Math.min(Number(max_tokens) || 300, 800),
         temperature: 0.7,
+        provider: { sort: "latency" },
+        // DeepSeek V4 defaults to thinking mode ON and rejects reasoning_effort:"none" —
+        // it needs this differently-shaped field to actually turn thinking off.
+        ...(disable_thinking ? { thinking: { type: "disabled" } } : {}),
         // Keeps repeat calls in the same conversation routed to the same provider
         // endpoint, which is what actually keeps a cache warm across calls.
         ...(session_id ? { session_id } : {}),
