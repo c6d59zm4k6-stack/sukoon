@@ -93,7 +93,7 @@ function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 // including ones that only ever return a 10-token JSON object. This alone was the
 // single biggest driver of the TPM rate-limit hit, since "requested" tokens count
 // against the same per-minute budget as prompt tokens.
-const TOKEN_BUDGETS={classifier:150,evaluator:120,coder:100,memory:200,main:450,retry:450};
+const TOKEN_BUDGETS={classifier:150,evaluator:120,evaluator_audit:120,coder:100,memory:200,main:450,retry:450};
 
 async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,overrideModel,overrideReasoning){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
@@ -181,6 +181,30 @@ const EVALUATOR_SYSTEM="You are a strict output evaluator for a supportive, non-
 // deterministic checks + fallback are the safety net if it does.
 const EVALUATOR_MODEL="qwen/qwen3.5-9b";
 async function evaluateReply(userText,draftReply){try{const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply}],"evaluator",undefined,undefined,EVALUATOR_MODEL,"none");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){}return{pass:true,issue:null}}
+// Not every issue type deserves the same trust from a cheap evaluator. OBVIOUS
+// ones are closer to keyword/topic detection — a small model should catch these
+// reliably, so they still block and retry immediately. COMPLEX ones require real
+// interpretive judgment (is this actually advice, or a validating reflection with
+// a question?) — exactly where the cheap model has now shown it over-flags. For
+// those, don't block this turn; let the reply through, and queue a follow-up
+// check with the full-cost model so a real issue doesn't just repeat unnoticed.
+const COMPLEX_EVALUATOR_ISSUES=new Set(["unsolicited_advice","low_empathy","unearned_complex_reflection"]);
+let pendingSteeringNote="";
+async function auditComplexFlag(userText,replyText,issue){
+  try{
+    const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
+    // No model override here — deliberately uses whatever's selected (the
+    // higher-cost model), since this is the second opinion, not the fast pass.
+    const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+replyText}],"evaluator_audit");
+    const parsed=safeParseJSON(raw);
+    if(parsed&&parsed.pass===false&&parsed.issue===issue){
+      pendingSteeringNote="Your previous reply was flagged for "+issue+" on a closer look — this turn, deliberately avoid repeating that pattern.";
+      console.log("[Sukoon] complex-flag CONFIRMED by high-cost audit:",issue);
+    }else{
+      console.log("[Sukoon] complex-flag was a false positive from the cheap evaluator:",issue);
+    }
+  }catch(e){/* fail silently — no steering note, nothing blocks on this */}
+}
 const SAFE_FALLBACK_REPLIES=["I want to make sure I'm actually being helpful here rather than just talking — could you tell me a bit more about what's going on?","Thanks for saying that again — I hear you. Tell me a bit more, in your own words, whenever you're ready.","I don't want to just repeat myself here. What feels most important to say about this right now?"];
 let lastFallbackText=null;
 function pickFallbackReply(){const pool=SAFE_FALLBACK_REPLIES.filter(r=>r!==lastFallbackText);const choice=pool[Math.floor(Math.random()*pool.length)];lastFallbackText=choice;return choice}
@@ -294,12 +318,18 @@ let fillerTimer2=setTimeout(async()=>{
 // Now: main does its own risk/scope self-check as part of one combined call (see
 // prompt.js SELF-CHECK section) — cuts a full sequential round trip off every turn.
 // contextNote only carries prior-turn state the model can't infer on its own.
-const contextNote=consecutiveConfusionTurns>=1?("CONTEXT: they have signaled confusion about your last message "+consecutiveConfusionTurns+" time(s) in a row so far."):"";
+const contextNote=[
+  consecutiveConfusionTurns>=1?("CONTEXT: they have signaled confusion about your last message "+consecutiveConfusionTurns+" time(s) in a row so far."):"",
+  pendingSteeringNote
+].filter(Boolean).join(" ");
+if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
 try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseCombinedReply(raw);console.log("[Sukoon] parsed reply:",parsed);replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);
 if(parsed.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
 if(parsed.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 lastCandidateActivity=(parsed.risk!=="elevated_distress"&&parsed.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
-let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
+let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);
+if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
+else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
 if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply(),quick_replies:[]};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){parsed={reply:"DEBUG: retry failed — "+(e2&&e2.message?e2.message:String(e2)),quick_replies:[]}}}
 removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});addBubble("assistant",parsed.reply,chip,parsed.quick_replies);if(!isFallback)codeCompanionTurn(text,parsed.reply)
 }catch(e){replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);removeTyping();const fallback="DEBUG: main flow failed — "+(e&&e.message?e.message:String(e));console.error("[Sukoon DEBUG]",e);history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
