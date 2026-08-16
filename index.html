@@ -94,7 +94,7 @@ function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 // including ones that only ever return a 10-token JSON object. This alone was the
 // single biggest driver of the TPM rate-limit hit, since "requested" tokens count
 // against the same per-minute budget as prompt tokens.
-const TOKEN_BUDGETS={classifier:150,evaluator:120,evaluator_audit:120,coder:100,memory:200,main:450,retry:450};
+const TOKEN_BUDGETS={classifier:150,evaluator:120,evaluator_audit:120,coder:100,memory:200,main:800,retry:800};
 
 async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,overrideModel,overrideReasoning){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
@@ -133,8 +133,18 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,ov
     return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
   }
   if(!response.ok) throw new Error((stage||"AI") + " HTTP " + response.status + ": " + (data.error||JSON.stringify(data)));
-  if(!data.text) throw new Error((stage||"AI") + " returned empty text");
-  console.log("[Sukoon] TIMING",stage,"took",Math.round(performance.now()-_t0),"ms");
+  if(!data.text){
+    if(!_isRetryAttempt){
+      // Almost always reasoning tokens eating the whole budget before any visible
+      // text gets written (same shape we already found and fixed for DeepSeek and
+      // the filler call) — worth one automatic retry before treating it as a real
+      // failure, same tier as the 429/400 handling above.
+      console.warn("[Sukoon]",stage,"returned empty text, retrying once");
+      return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
+    }
+    throw new Error((stage||"AI") + " returned empty text");
+  }
+  console.log("[Sukoon] TIMING",stage,"("+modelToUse+")","took",Math.round(performance.now()-_t0),"ms");
   return data.text;
 }
 const MAX_REPLY_WORDS=70,MAX_READING_GRADE=5.4;
@@ -233,10 +243,14 @@ function parseCombinedReply(raw){
     }
   }
   // Defaults to the safe/normal case if parsing fails for any reason — same
-  // fail-open direction the old standalone classify() used on error.
+  // fail-open direction the old standalone classify() used on error. hadReplyLabel
+  // is exposed separately so the caller can treat a missing label as a real
+  // failure (retry) rather than silently showing whatever raw text came back —
+  // this is exactly what let a bare "RISK: none" leak into the chat once.
   return {
     risk: riskMatch ? riskMatch[1].toLowerCase() : "none",
     scope: scopeMatch ? scopeMatch[1].toLowerCase() : "in_scope",
+    hadReplyLabel: !!replyMatch,
     reply: reply || raw.trim(),
     quick_replies
   };
@@ -347,12 +361,14 @@ try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHis
 if(parsed.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
 if(parsed.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 lastCandidateActivity=(parsed.risk!=="elevated_distress"&&parsed.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
-let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);
+let evalResult=parsed.hadReplyLabel?{pass:true,issue:null}:{pass:false,issue:"missing_reply_label"};
+if(evalResult.pass){evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);}
+else console.log("[Sukoon] output had no REPLY: label — treating as a failure instead of showing raw text:",parsed.reply);
 if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
 else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
-if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply(),quick_replies:[]};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){parsed={reply:"DEBUG: retry failed — "+(e2&&e2.message?e2.message:String(e2)),quick_replies:[]}}}
+if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply(),quick_replies:[]};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply(),quick_replies:[]}}}
 removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});addBubble("assistant",parsed.reply,chip,parsed.quick_replies);if(!isFallback)codeCompanionTurn(text,parsed.reply)
-}catch(e){replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);removeTyping();const fallback="DEBUG: main flow failed — "+(e&&e.message?e.message:String(e));console.error("[Sukoon DEBUG]",e);history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
+}catch(e){replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
 function renderMemoryList(){memoryListEl.innerHTML="";if(!memoryFacts.length){memoryListEl.innerHTML="<p class='memory-empty'>Nothing saved yet — Sukoon remembers little things as you talk, so it's less repetitive next time.</p>";return}memoryFacts.forEach(f=>{const li=document.createElement("li");li.textContent=f;memoryListEl.appendChild(li)})}
