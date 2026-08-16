@@ -163,6 +163,14 @@ async function loadAggregate(){try{const v=localStorage.getItem("sukoon_mi_aggre
 async function persistAggregate(codes){codes.forEach(c=>{if(c in aggregateTally)aggregateTally[c]++});aggregateTally.turns++;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:aggregateSessions}))}catch(e){}}
 async function resetAggregate(){aggregateTally=emptyTally();aggregateSessions=0;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:0}))}catch(e){}renderDebugPanel()}
 let history=[],memoryFacts=[],memoryEnabled=true,usedActivityIds=new Set(),lastCandidateActivity=null,userTurnCount=0,askedQuestions=[],consecutiveConfusionTurns=0;
+// Tracked in JS, not left to the model to remember — set once from the very
+// first message, consumed exactly once at the check-in turn. Self-tracked state
+// like this has already shown drift elsewhere (RISK/SCOPE labels, question
+// stacking), so anything that has to fire exactly once belongs in real state.
+let initialIntent=null;
+let ventCheckInDone=false;
+const VENT_PATTERNS=["just want to vent","just wanted to vent","just needed to vent","want to vent","wanted to vent"];
+const VENT_CHECKIN_AT_TURN=6;
 const chatEl=document.getElementById("chat"),composer=document.getElementById("composer"),sendBtn=document.getElementById("send-btn"),helpBtn=document.getElementById("help-btn"),memoryBtn=document.getElementById("memory-btn"),memoryOverlay=document.getElementById("memory-overlay"),memoryListEl=document.getElementById("memory-list"),memoryToggle=document.getElementById("memory-toggle"),forgetBtn=document.getElementById("forget-btn"),closeMemoryBtn=document.getElementById("close-memory-btn");
 const modelSelectEl=document.getElementById("model-select");
 MODEL_OPTIONS.forEach(m=>{const opt=document.createElement("option");opt.value=m.id;opt.textContent=m.label;modelSelectEl.appendChild(opt)});
@@ -242,7 +250,7 @@ const FILLER_REPLIES=["hmm.","mm.","yeah...","right...","mm, okay.","yeah, go on
 const FILLER_MODEL="qwen/qwen3.5-9b";
 const FILLER_SYSTEM="You are generating a tiny, instant spoken reaction — like \"hmm\", \"oh no\", \"wait\", \"oof\" — to what the person just said, while a fuller reply is still being written. This is NOT the actual reply, just a brief natural aside. Respond with 2-8 words only. No question marks, no advice, no claims — just a short spoken reaction fragment. Output only the fragment, nothing else.";
 const FILLER_LLM_TIMEOUT_MS=900;
-const FILLER_TIER2_DELAY_MS=3800;
+const FILLER_TIER2_DELAY_MS=2000;
 function isSafeFillerText(text){
   if(!text)return false;
   const t=text.trim();
@@ -302,7 +310,9 @@ function buildCanonicalSystemPrompt(contextNote){
     scopeDirective: contextNote
   });
 }
-async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();
+async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;
+if(userTurnCount===1){const n=normalise(text);if(VENT_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="vent"}
+if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();
 // Occasionally shows a quick "hmm." / "yeah..." aside if the reply takes a moment —
 // not every turn (45% chance), and only if it's still waiting 1.3s in. Cancelled the
 // instant a real response comes back, so it never trails behind or shows up stale.
@@ -318,9 +328,15 @@ let fillerTimer2=setTimeout(async()=>{
 // Now: main does its own risk/scope self-check as part of one combined call (see
 // prompt.js SELF-CHECK section) — cuts a full sequential round trip off every turn.
 // contextNote only carries prior-turn state the model can't infer on its own.
+let ventCheckNote="";
+if(initialIntent==="vent"&&!ventCheckInDone&&userTurnCount>=VENT_CHECKIN_AT_TURN){
+  ventCheckNote="They said early on they just wanted to vent — that's been the assumed goal. It's been a few turns now: this turn, naturally check in, genuinely open to either answer — are they looking to keep talking it through, or is there something they're trying to figure out or do about it? Don't push toward solutions, just ask.";
+  ventCheckInDone=true;
+}
 const contextNote=[
   consecutiveConfusionTurns>=1?("CONTEXT: they have signaled confusion about your last message "+consecutiveConfusionTurns+" time(s) in a row so far."):"",
-  pendingSteeringNote
+  pendingSteeringNote,
+  ventCheckNote
 ].filter(Boolean).join(" ");
 if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
 try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseCombinedReply(raw);console.log("[Sukoon] parsed reply:",parsed);replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);
