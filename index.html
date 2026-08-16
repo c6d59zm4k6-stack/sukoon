@@ -197,7 +197,42 @@ function parseCombinedReply(raw){
 }
 // Short, throwaway asides shown while waiting — never sent to the model as real
 // conversation, never counted as part of history. Purely a UI nicety.
-const FILLER_REPLIES=["hmm.","mm.","yeah...","right...","mm, okay.","uh-huh.","yeah, go on."];
+const FILLER_REPLIES=["hmm.","mm.","yeah...","right...","mm, okay.","yeah, go on."];
+// Tier 2: a genuine small/cheap model, only attempted if the real reply is still
+// not back after a while. Races against its own short cutoff so it can never
+// delay anything — if it's not back in time, or fails, or fails the safety gate,
+// we just fall back to a generic tier-1-style phrase instead.
+const FILLER_MODEL="qwen/qwen3.5-9b";
+const FILLER_SYSTEM="You are generating a tiny, instant spoken reaction — like \"hmm\", \"oh no\", \"wait\", \"oof\" — to what the person just said, while a fuller reply is still being written. This is NOT the actual reply, just a brief natural aside. Respond with 2-8 words only. No question marks, no advice, no claims — just a short spoken reaction fragment. Output only the fragment, nothing else.";
+const FILLER_LLM_TIMEOUT_MS=900;
+const FILLER_TIER2_DELAY_MS=3800;
+function isSafeFillerText(text){
+  if(!text)return false;
+  const t=text.trim();
+  if(!t||t.length>60)return false;
+  const words=t.split(/\s+/).filter(Boolean);
+  if(!words.length||words.length>10)return false;
+  if(t.includes("?"))return false;
+  return true;
+}
+async function fetchContextualFiller(userText){
+  const _t0=performance.now();
+  const controller=new AbortController();
+  const timeoutId=setTimeout(()=>controller.abort(),FILLER_LLM_TIMEOUT_MS);
+  try{
+    const response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:FILLER_SYSTEM,messages:[{role:"user",content:userText}],model:FILLER_MODEL,max_tokens:20,plain_text:true}),signal:controller.signal});
+    clearTimeout(timeoutId);
+    const data=await response.json();
+    console.log("[Sukoon] TIMING filler-llm took",Math.round(performance.now()-_t0),"ms","— result:",data&&data.text);
+    if(!response.ok||!data.text)return null;
+    const text=data.text.trim();
+    return isSafeFillerText(text)?text:null;
+  }catch(e){
+    clearTimeout(timeoutId);
+    console.log("[Sukoon] TIMING filler-llm aborted/failed after",Math.round(performance.now()-_t0),"ms");
+    return null;
+  }
+}
 function addFillerBubble(text){
   const row=document.createElement("div");
   row.className="bubble-row companion";
@@ -235,19 +270,26 @@ async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())retur
 // not every turn (45% chance), and only if it's still waiting 1.3s in. Cancelled the
 // instant a real response comes back, so it never trails behind or shows up stale.
 let fillerTimer=setTimeout(()=>{if(Math.random()<0.45){addFillerBubble(FILLER_REPLIES[Math.floor(Math.random()*FILLER_REPLIES.length)])}},1300);
+let replyLanded=false;
+let fillerTimer2=setTimeout(async()=>{
+  if(replyLanded)return;
+  const contextual=await fetchContextualFiller(text);
+  if(replyLanded)return; // real reply may have landed while that call was in flight
+  addFillerBubble(contextual||FILLER_REPLIES[Math.floor(Math.random()*FILLER_REPLIES.length)]);
+},FILLER_TIER2_DELAY_MS);
 // Was: a separate classify() call before main, gating what main was told to do.
 // Now: main does its own risk/scope self-check as part of one combined call (see
 // prompt.js SELF-CHECK section) — cuts a full sequential round trip off every turn.
 // contextNote only carries prior-turn state the model can't infer on its own.
 const contextNote=consecutiveConfusionTurns>=1?("CONTEXT: they have signaled confusion about your last message "+consecutiveConfusionTurns+" time(s) in a row so far."):"";
-try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseCombinedReply(raw);console.log("[Sukoon] parsed reply:",parsed);clearTimeout(fillerTimer);
+try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseCombinedReply(raw);console.log("[Sukoon] parsed reply:",parsed);replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);
 if(parsed.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
 if(parsed.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 lastCandidateActivity=(parsed.risk!=="elevated_distress"&&parsed.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
 let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
 if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply(),quick_replies:[]};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){parsed={reply:"DEBUG: retry failed — "+(e2&&e2.message?e2.message:String(e2)),quick_replies:[]}}}
 removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});addBubble("assistant",parsed.reply,chip,parsed.quick_replies);if(!isFallback)codeCompanionTurn(text,parsed.reply)
-}catch(e){clearTimeout(fillerTimer);removeTyping();const fallback="DEBUG: main flow failed — "+(e&&e.message?e.message:String(e));console.error("[Sukoon DEBUG]",e);history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
+}catch(e){replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);removeTyping();const fallback="DEBUG: main flow failed — "+(e&&e.message?e.message:String(e));console.error("[Sukoon DEBUG]",e);history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
 function renderMemoryList(){memoryListEl.innerHTML="";if(!memoryFacts.length){memoryListEl.innerHTML="<p class='memory-empty'>Nothing saved yet — Sukoon remembers little things as you talk, so it's less repetitive next time.</p>";return}memoryFacts.forEach(f=>{const li=document.createElement("li");li.textContent=f;memoryListEl.appendChild(li)})}
