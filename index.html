@@ -248,15 +248,15 @@ const FILLER_REPLIES=["hmm.","mm.","yeah...","right...","mm, okay.","yeah, go on
 // delay anything — if it's not back in time, or fails, or fails the safety gate,
 // we just fall back to a generic tier-1-style phrase instead.
 const FILLER_MODEL="qwen/qwen3.5-9b";
-const FILLER_SYSTEM="You are generating a tiny, instant spoken reaction — like \"hmm\", \"oh no\", \"wait\", \"oof\" — to what the person just said, while a fuller reply is still being written. This is NOT the actual reply, just a brief natural aside. Respond with 2-8 words only. No question marks, no advice, no claims — just a short spoken reaction fragment. Output only the fragment, nothing else.";
+const FILLER_SYSTEM="You are generating a tiny 1-3 word spoken reaction — like \"ugh.\", \"oh no.\", \"wow.\", \"oof.\", \"geez.\" — to what the person just said, while a fuller reply is still being written. This is NOT the actual reply. Do NOT assess, judge, or comment on their situation — never things like \"that sounds hard\" or \"that's stressful\" — the real reply is about to say something like that already, so a similar filler just repeats it right before. Just a short exclamation or sound, 1-3 words only, no question marks, no claims. Output only that, nothing else.";
 const FILLER_LLM_TIMEOUT_MS=900;
 const FILLER_TIER2_DELAY_MS=2000;
 function isSafeFillerText(text){
   if(!text)return false;
   const t=text.trim();
-  if(!t||t.length>60)return false;
+  if(!t||t.length>30)return false;
   const words=t.split(/\s+/).filter(Boolean);
-  if(!words.length||words.length>10)return false;
+  if(!words.length||words.length>3)return false;
   if(t.includes("?"))return false;
   return true;
 }
@@ -316,13 +316,16 @@ if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content
 // Occasionally shows a quick "hmm." / "yeah..." aside if the reply takes a moment —
 // not every turn (45% chance), and only if it's still waiting 1.3s in. Cancelled the
 // instant a real response comes back, so it never trails behind or shows up stale.
-let fillerTimer=setTimeout(()=>{if(Math.random()<0.45){addFillerBubble(FILLER_REPLIES[Math.floor(Math.random()*FILLER_REPLIES.length)])}},1300);
+let shownFillerWord=null;
+let fillerTimer=setTimeout(()=>{if(Math.random()<0.45){shownFillerWord=FILLER_REPLIES[Math.floor(Math.random()*FILLER_REPLIES.length)];addFillerBubble(shownFillerWord)}},1300);
 let replyLanded=false;
 let fillerTimer2=setTimeout(async()=>{
   if(replyLanded)return;
   const contextual=await fetchContextualFiller(text);
   if(replyLanded)return; // real reply may have landed while that call was in flight
-  addFillerBubble(contextual||FILLER_REPLIES[Math.floor(Math.random()*FILLER_REPLIES.length)]);
+  let fallbackPool=FILLER_REPLIES.filter(w=>w!==shownFillerWord);
+  if(!fallbackPool.length)fallbackPool=FILLER_REPLIES;
+  addFillerBubble(contextual||fallbackPool[Math.floor(Math.random()*fallbackPool.length)]);
 },FILLER_TIER2_DELAY_MS);
 // Was: a separate classify() call before main, gating what main was told to do.
 // Now: main does its own risk/scope self-check as part of one combined call (see
