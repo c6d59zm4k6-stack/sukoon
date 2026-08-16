@@ -95,12 +95,20 @@ function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 // against the same per-minute budget as prompt tokens.
 const TOKEN_BUDGETS={classifier:150,evaluator:120,coder:100,memory:200,main:450,retry:450};
 
-async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
+async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,overrideModel,overrideReasoning){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
   const _t0=performance.now();
+  // overrideModel lets a call (e.g. the evaluator) pin to a specific model
+  // regardless of the dropdown selection. disable_thinking is tied to specific
+  // SELECTED_MODEL entries (currently the DeepSeek ones) so it's deliberately
+  // NOT carried over when overriding — an overridden call should be explicit
+  // about its own reasoning setting via overrideReasoning instead.
+  const modelToUse=overrideModel||SELECTED_MODEL;
+  const reasoningToUse=overrideModel?overrideReasoning:currentModelConfig().reasoning;
+  const disableThinkingToUse=overrideModel?false:!!currentModelConfig().disableThinking;
   let response;
   try {
-    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:SELECTED_MODEL,max_tokens:budget,plain_text:(stage==="main"||stage==="retry"),reasoning_effort:currentModelConfig().reasoning,session_id:SESSION_ID,disable_thinking:!!currentModelConfig().disableThinking})});
+    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:modelToUse,max_tokens:budget,plain_text:(stage==="main"||stage==="retry"),reasoning_effort:reasoningToUse,session_id:SESSION_ID,disable_thinking:disableThinkingToUse})});
   } catch(e) {
     throw new Error((stage||"AI") + " network error: " + (e && e.message ? e.message : String(e)));
   }
@@ -113,7 +121,7 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
     // retry once, fast (this isn't a rate limit, no need for a long backoff).
     console.warn("[Sukoon]",stage,"hit a JSON-generation miss, retrying once");
     await sleep(400);
-    return callGroq(systemPrompt,messages,stage,maxTokens,true);
+    return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
   }
   if(response.status===429 && !_isRetryAttempt){
     // Transient rate limit — back off once and retry, instead of failing straight
@@ -121,7 +129,7 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt){
     const waitSec=Math.min(Math.max((data && data.retryAfter) || 6, 3),20);
     console.warn("[Sukoon]",stage,"hit 429, backing off",waitSec,"s before one retry");
     await sleep(waitSec*1000);
-    return callGroq(systemPrompt,messages,stage,maxTokens,true);
+    return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
   }
   if(!response.ok) throw new Error((stage||"AI") + " HTTP " + response.status + ": " + (data.error||JSON.stringify(data)));
   if(!data.text) throw new Error((stage||"AI") + " returned empty text");
@@ -166,8 +174,13 @@ function addCrisisCard(){const row=document.createElement("div");row.className="
 function addTyping(){const row=document.createElement("div");row.className="bubble-row companion";row.id="typing-row";row.innerHTML="<div class='bubble typing'><span></span><span></span><span></span></div>";chatEl.appendChild(row);scrollToBottom()}function removeTyping(){const row=document.getElementById("typing-row");if(row)row.remove()}
 const CLASSIFY_SYSTEM="You are a safety and scope classifier for a supportive, non-clinical AI companion chat. Given the latest user message and brief recent context, output ONLY compact JSON: {\"risk\":\"none\"|\"crisis\"|\"elevated_distress\",\"scope\":\"in_scope\"|\"medical_advice_seeking\"|\"diagnosis_seeking\"|\"unrelated_task\"|\"confused_by_question\"}. crisis = explicit or strongly implied suicidal ideation, self-harm intent, or immediate danger. elevated_distress = significant distress or hopelessness without explicit crisis. medical_advice_seeking = medication/dose/treatment. diagnosis_seeking = asking for a condition/diagnosis. unrelated_task = coding, homework, trivia, etc. confused_by_question = the person says they don't understand, are confused by, or are pushing back on the companion's own last question or reflection (e.g. 'I don't understand what you mean', 'what does that even mean', 'that question doesn't make sense', 'huh?'). Do not use this for general life confusion unrelated to the companion's last message. in_scope = normal supportive conversation.";
 async function classify(latestUserText){const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");try{const raw=await callGroq(CLASSIFY_SYSTEM,[{role:"user",content:"Latest user message:\n"+latestUserText+"\n\nRecent context:\n"+recentContext}],"classifier");const parsed=safeParseJSON(raw);if(parsed&&parsed.risk&&parsed.scope)return parsed}catch(e){}return{risk:"none",scope:"in_scope"}}
-const EVALUATOR_SYSTEM="You are a strict output evaluator for a supportive, non-clinical AI companion reply. Judge: no unsolicited advice unless explicitly asked; no diagnosis/clinical language; no medication/treatment recommendations; warm and validating; no unrelated tasks; no parasocial claims; no unearned complex reflection. Respond ONLY JSON: {\"pass\":true|false,\"issue\":null|\"unsolicited_advice\"|\"diagnosis_language\"|\"medication_mention\"|\"low_empathy\"|\"out_of_scope\"|\"parasocial_overclaim\"|\"unearned_complex_reflection\"}";
-async function evaluateReply(userText,draftReply){try{const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"User's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply}],"evaluator");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){}return{pass:true,issue:null}}
+const EVALUATOR_SYSTEM="You are a strict output evaluator for a supportive, non-clinical AI companion reply. Judge: no unsolicited advice unless explicitly asked; no diagnosis/clinical language; no medication/treatment recommendations; warm and validating; no unrelated tasks; no parasocial claims; no unearned complex reflection; no fabricated detail. fabricated_detail = the reply references a specific activity, object, event, or detail that the person did not actually say, even loosely — check the recent conversation provided, not just the last message. Respond ONLY JSON: {\"pass\":true|false,\"issue\":null|\"unsolicited_advice\"|\"diagnosis_language\"|\"medication_mention\"|\"low_empathy\"|\"out_of_scope\"|\"parasocial_overclaim\"|\"unearned_complex_reflection\"|\"fabricated_detail\"}";
+// Independent of the dropdown — the evaluator is a fixed, cheap check regardless
+// of which model is generating the reply. Known risk, accepted deliberately: a
+// small model may pass things a stronger one would catch. The existing retry +
+// deterministic checks + fallback are the safety net if it does.
+const EVALUATOR_MODEL="qwen/qwen3.5-9b";
+async function evaluateReply(userText,draftReply){try{const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply}],"evaluator",undefined,undefined,EVALUATOR_MODEL,"none");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){}return{pass:true,issue:null}}
 const SAFE_FALLBACK_REPLIES=["I want to make sure I'm actually being helpful here rather than just talking — could you tell me a bit more about what's going on?","Thanks for saying that again — I hear you. Tell me a bit more, in your own words, whenever you're ready.","I don't want to just repeat myself here. What feels most important to say about this right now?"];
 let lastFallbackText=null;
 function pickFallbackReply(){const pool=SAFE_FALLBACK_REPLIES.filter(r=>r!==lastFallbackText);const choice=pool[Math.floor(Math.random()*pool.length)];lastFallbackText=choice;return choice}
@@ -220,7 +233,7 @@ async function fetchContextualFiller(userText){
   const controller=new AbortController();
   const timeoutId=setTimeout(()=>controller.abort(),FILLER_LLM_TIMEOUT_MS);
   try{
-    const response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:FILLER_SYSTEM,messages:[{role:"user",content:userText}],model:FILLER_MODEL,max_tokens:20,plain_text:true}),signal:controller.signal});
+    const response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:FILLER_SYSTEM,messages:[{role:"user",content:userText}],model:FILLER_MODEL,max_tokens:20,plain_text:true,reasoning_effort:"none"}),signal:controller.signal});
     clearTimeout(timeoutId);
     const data=await response.json();
     console.log("[Sukoon] TIMING filler-llm took",Math.round(performance.now()-_t0),"ms","— result:",data&&data.text);
