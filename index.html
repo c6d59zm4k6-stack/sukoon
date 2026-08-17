@@ -189,6 +189,433 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,ov
 const MAX_REPLY_WORDS=70,MAX_READING_GRADE=10,MIN_WORDS_FOR_READING_CHECK=8;
 function wordCount(text){return text.trim().split(/\s+/).filter(Boolean).length}
 function countSyllables(word){word=word.toLowerCase().replace(/[^a-z]/g,"");if(!word)return 0;if(word.length<=3)return 1;word=word.replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/,"");word=word.replace(/^y/,"");const matches=word.match(/[aeiouy]{1,2}/g);return matches?matches.length:1}
+function fleschKincaidGrade(text){
+  // Em-dashes and paragraph breaks read as pauses/sentence breaks, but the
+  // formula only split on . ! ? — so a reply like "short thought — short
+  // thought.\n\nshort thought?" was counted as one giant run-on sentence,
+  // scoring "hard to read" purely from length, not actual complexity. Splitting
+  // on those too makes the sentence count match how the text actually reads.
+  const sentences=text.split(/[.!?]+|—|\n+/).map(s=>s.trim()).filter(Boolean),
+  words=text.split(/\s+/).map(w=>w.replace(/[^a-zA-Z']/g,"")).filter(Boolean);
+  if(!words.length)return 0;
+  const sc=Math.max(sentences.length,1),wc=words.length;
+  let syllables=0;words.forEach(w=>syllables+=countSyllables(w));
+  return .39*(wc/sc)+11.8*(syllables/wc)-15.59
+}
+function extractQuestion(text){const m=text.match(/([^.!?]*\?)/);return m?normalise(m[1]).trim():null}
+function questionSimilarity(a,b){const wa=new Set(a.split(" ").filter(Boolean)),wb=new Set(b.split(" ").filter(Boolean));if(!wa.size||!wb.size)return 0;let overlap=0;wa.forEach(w=>{if(wb.has(w))overlap++});return overlap/new Set([...wa,...wb]).size}
+function isRepeatedQuestion(text,askedQs){const q=extractQuestion(text);if(!q)return false;return askedQs.some(prior=>questionSimilarity(q,prior)>0.7)}
+function deterministicChecks(text,askedQs){if(wordCount(text)>MAX_REPLY_WORDS)return{pass:false,issue:"too_long"};if(wordCount(text)>=MIN_WORDS_FOR_READING_CHECK&&fleschKincaidGrade(text)>MAX_READING_GRADE)return{pass:false,issue:"reading_level_too_high"};if((text.match(/\?/g)||[]).length>1)return{pass:false,issue:"multiple_questions"};if(isRepeatedQuestion(text,askedQs||[]))return{pass:false,issue:"repeated_question"};return{pass:true,issue:null}}
+function safeParseJSON(text){try{return JSON.parse(text.replace(/```json|```/g,"").trim())}catch(e){return null}}
+const MI_TARGETS={rq_ratio:{target:1,tolerance:.15,label:"Reflection:Question ratio"},pct_open:{target:.70,tolerance:.15,label:"Open questions (of all questions)"},pct_complex:{target:.30,tolerance:.15,label:"Complex reflections (of all reflections)"}};
+const MIN_CODED_TURNS_BEFORE_STEERING=4;const emptyTally=()=>({simple_reflection:0,complex_reflection:0,open_question:0,closed_question:0,advice:0,other:0,turns:0});
+let sessionTally=emptyTally(),aggregateTally=emptyTally(),aggregateSessions=0;
+const CODER_SYSTEM="You are a MITI-style behavioral coder for a supportive chat companion's single reply. Given the user's message and the companion's reply, identify which behaviors the reply contains. Definitions: simple_reflection mirrors back what the person said, adding little or no new meaning. complex_reflection names an unspoken feeling, meaning, or implication beyond what was literally said. open_question cannot be answered with yes/no or a single word. closed_question can. advice is a suggestion, recommendation, tip, or instruction. Assign AT MOST ONE reflection and AT MOST ONE question. Respond ONLY with compact JSON: {\"codes\":[\"...\"]}";
+function regexFallbackCodes(reply){const codes=[],qMatch=reply.match(/[^.!?]*\?/);if(qMatch){const q=qMatch[0].trim().toLowerCase();codes.push(/^(do|does|did|is|are|was|were|can|could|will|would|have|has|had|should|any|would you)\b/.test(q)?"closed_question":"open_question")}if(!codes.length)codes.push("other");return codes}
+async function codeCompanionTurn(userText,replyText){let codes;try{const raw=await callGroq(CODER_SYSTEM,[{role:"user",content:"User said:\n"+userText+"\n\nCompanion replied:\n"+replyText}],"coder");const parsed=safeParseJSON(raw);codes=parsed&&Array.isArray(parsed.codes)&&parsed.codes.length?parsed.codes:regexFallbackCodes(replyText)}catch(e){codes=regexFallbackCodes(replyText)}const reflection=codes.includes("complex_reflection")?"complex_reflection":codes.includes("simple_reflection")?"simple_reflection":null,question=codes.includes("open_question")?"open_question":codes.includes("closed_question")?"closed_question":null,clean=[reflection,question].filter(Boolean);if(codes.includes("advice"))clean.push("advice");if(!clean.length)clean.push("other");clean.forEach(c=>{if(c in sessionTally)sessionTally[c]++});sessionTally.turns++;await persistAggregate(clean);logFidelity()}
+function computeMetrics(t){const reflections=t.simple_reflection+t.complex_reflection,questions=t.open_question+t.closed_question;return{rq_ratio:questions?reflections/questions:null,pct_open:questions?t.open_question/questions:null,pct_complex:reflections?t.complex_reflection/reflections:null,reflections,questions,advice:t.advice,turns:t.turns}}
+function bandStatus(key,value){if(value===null)return"no data";const cfg=MI_TARGETS[key],lo=cfg.target*(1-cfg.tolerance),hi=cfg.target*(1+cfg.tolerance);return value<lo?"below band":value>hi?"above band":"in band"}
+function buildSteeringDirective(){if(sessionTally.turns<MIN_CODED_TURNS_BEFORE_STEERING)return"";const m=computeMetrics(sessionTally),notes=[];if(bandStatus("rq_ratio",m.rq_ratio)==="below band")notes.push("You have been asking more than reflecting this session — favour a reflection this turn instead of a question.");if(bandStatus("rq_ratio",m.rq_ratio)==="above band")notes.push("You have been reflecting much more than asking — a short open question would help move things forward this turn.");if(bandStatus("pct_open",m.pct_open)==="below band")notes.push("Too many of your questions have been yes/no ones — if you ask this turn, make it genuinely open.");if(bandStatus("pct_complex",m.pct_complex)==="above band")notes.push("You have been inferring unspoken meaning quite often — stay closer to their literal words this turn.");return notes.length?"CONVERSATION BALANCE (internal note): "+notes.join(" "):""}
+function logFidelity(){const s=computeMetrics(sessionTally),a=computeMetrics(aggregateTally);console.log("[Sukoon MI fidelity]",{session:s,allTime:{sessions:aggregateSessions,...a}});if(document.getElementById("debug-overlay").classList.contains("open"))renderDebugPanel()}
+async function loadMemory(){try{const v=localStorage.getItem("sukoon_memory");return v?JSON.parse(v):[]}catch(e){return[]}}
+async function saveMemory(arr){try{localStorage.setItem("sukoon_memory",JSON.stringify(arr))}catch(e){}}
+async function loadMemoryEnabled(){try{const v=localStorage.getItem("sukoon_memory_enabled");return v?JSON.parse(v):true}catch(e){return true}}
+async function saveMemoryEnabled(val){try{localStorage.setItem("sukoon_memory_enabled",JSON.stringify(val))}catch(e){}}
+async function loadAggregate(){try{const v=localStorage.getItem("sukoon_mi_aggregate");if(v){const parsed=JSON.parse(v);aggregateTally=Object.assign(emptyTally(),parsed.tally||{});aggregateSessions=parsed.sessions||0}}catch(e){}}
+async function persistAggregate(codes){codes.forEach(c=>{if(c in aggregateTally)aggregateTally[c]++});aggregateTally.turns++;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:aggregateSessions}))}catch(e){}}
+async function resetAggregate(){aggregateTally=emptyTally();aggregateSessions=0;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:0}))}catch(e){}renderDebugPanel()}
+let history=[],memoryFacts=[],memoryEnabled=true,usedActivityIds=new Set(),lastCandidateActivity=null,userTurnCount=0,askedQuestions=[],consecutiveConfusionTurns=0;
+// Bumped at the start of every sendMessage() — lets the async quick-reply
+// fetch tell whether it's still answering the latest turn by the time it
+// resolves, or a newer message has already started (see maybeAttachQuickReplies).
+let replyGeneration=0;
+// Tracked in JS, not left to the model to remember — set once from the very
+// first message, consumed exactly once at the check-in turn. Self-tracked state
+// like this has already shown drift elsewhere (RISK/SCOPE labels, question
+// stacking), so anything that has to fire exactly once belongs in real state.
+let initialIntent=null;
+let ventCheckInDone=false;
+const VENT_PATTERNS=["just want to vent","just wanted to vent","just needed to vent","want to vent","wanted to vent"];
+const VENT_CHECKIN_AT_TURN=6;
+const chatEl=document.getElementById("chat"),composer=document.getElementById("composer"),sendBtn=document.getElementById("send-btn"),helpBtn=document.getElementById("help-btn"),memoryBtn=document.getElementById("memory-btn"),memoryOverlay=document.getElementById("memory-overlay"),memoryListEl=document.getElementById("memory-list"),memoryToggle=document.getElementById("memory-toggle"),forgetBtn=document.getElementById("forget-btn"),closeMemoryBtn=document.getElementById("close-memory-btn"),moreBtn=document.getElementById("more-btn"),morePanel=document.getElementById("more-panel");
+const modelSelectEl=document.getElementById("model-select");
+MODEL_OPTIONS.forEach(m=>{const opt=document.createElement("option");opt.value=m.id;opt.textContent=m.label;modelSelectEl.appendChild(opt)});
+modelSelectEl.value=SELECTED_MODEL;
+modelSelectEl.addEventListener("change",()=>{SELECTED_MODEL=modelSelectEl.value;saveSelectedModel(SELECTED_MODEL)});
+function scrollToBottom(){chatEl.scrollTop=chatEl.scrollHeight}function clearQuickReplyChips(){document.querySelectorAll(".quick-replies").forEach(el=>el.remove())}
+// Shared by addBubble (greeting's hardcoded chips) and appendQuickReplies (the
+// async quick-reply model's result) so both render buttons identically.
+function buildQuickReplyChips(quickReplies){
+  if(!quickReplies||!quickReplies.length)return null;
+  const wrap=document.createElement("div");
+  wrap.className="quick-replies";
+  quickReplies.slice(0,3).forEach(qr=>{
+    if(!qr||!qr.trim()||qr.includes("?"))return;
+    const btn=document.createElement("button");
+    btn.type="button";
+    btn.className="quick-chip";
+    btn.textContent=qr;
+    btn.addEventListener("click",()=>sendMessage(qr,{skipClassify:true}));
+    wrap.appendChild(btn);
+  });
+  return wrap.children.length?wrap:null;
+}
+function addBubble(role,text,chipActivity,quickReplies){const row=document.createElement("div");row.className="bubble-row "+(role==="user"?"user":"companion");const bubble=document.createElement("div");bubble.className="bubble";bubble.textContent=text;row.appendChild(bubble);if(chipActivity){const chip=document.createElement("div");chip.className="chip";chip.title=chipActivity.desc;chip.innerHTML="🧭 Suggested: <b>"+chipActivity.title+"</b> · "+chipActivity.duration;row.appendChild(chip)}const qrWrap=buildQuickReplyChips(quickReplies);if(qrWrap)row.appendChild(qrWrap);chatEl.appendChild(row);scrollToBottom();return row}
+// Appends quick-reply chips to an already-displayed bubble, once the separate
+// small-model call resolves — never blocks or delays the main reply itself.
+function appendQuickReplies(row,quickReplies){
+  if(!row||!row.isConnected)return false; // bubble scrolled away/removed — nothing to attach to
+  const qrWrap=buildQuickReplyChips(quickReplies);
+  if(!qrWrap)return false;
+  row.appendChild(qrWrap);
+  scrollToBottom();
+  return true;
+}
+function addQuickRepliesOnly(quickReplies){
+  console.log("[Sukoon] addQuickRepliesOnly called with:",quickReplies);
+  if(!quickReplies||!quickReplies.length){console.warn("[Sukoon] addQuickRepliesOnly got nothing to render");return}
+  const wrap=document.createElement("div");
+  wrap.className="quick-replies";
+  wrap.style.justifyContent="center";
+  wrap.style.maxWidth="100%";
+  quickReplies.slice(0,3).forEach(qr=>{
+    if(!qr||!qr.trim())return;
+    const btn=document.createElement("button");
+    btn.type="button";
+    btn.className="quick-chip";
+    btn.textContent=qr;
+    btn.addEventListener("click",()=>sendMessage(qr,{skipClassify:true}));
+    wrap.appendChild(btn);
+  });
+  chatEl.appendChild(wrap);
+  console.log("[Sukoon] quick-replies wrap appended, children:",wrap.children.length,"chatEl now has",chatEl.children.length,"children");
+  scrollToBottom();
+}
+function addCrisisCard(){const row=document.createElement("div");row.className="bubble-row companion";const card=document.createElement("div");card.className="crisis-card";card.innerHTML="<h3>You don't have to go through this alone</h3><p>What you're feeling matters, and there are people ready to listen right now — free and confidential.</p><div class='lines'><div class='line'><strong>Tele-MANAS (24/7, govt. helpline)</strong><a href='tel:14416'>14416</a></div><div class='line'><strong>Vandrevala Foundation (24/7)</strong><a href='tel:+919999666555'>+91 9999 666 555</a></div></div><p class='close-note'>You can keep talking here too — I'm not going anywhere.</p>";row.appendChild(card);chatEl.appendChild(row);scrollToBottom()}
+function addTyping(){const row=document.createElement("div");row.className="bubble-row companion";row.id="typing-row";row.innerHTML="<div class='bubble typing'><span></span><span></span><span></span></div>";chatEl.appendChild(row);scrollToBottom()}function removeTyping(){const row=document.getElementById("typing-row");if(row)row.remove()}
+const CLASSIFY_SYSTEM="You are a safety and scope classifier for a supportive, non-clinical AI companion chat. Given the latest user message and brief recent context, output ONLY compact JSON: {\"risk\":\"none\"|\"crisis\"|\"elevated_distress\",\"scope\":\"in_scope\"|\"medical_advice_seeking\"|\"diagnosis_seeking\"|\"unrelated_task\"|\"confused_by_question\"}. crisis = explicit or strongly implied suicidal ideation, self-harm intent, or immediate danger. elevated_distress = significant distress or hopelessness without explicit crisis. medical_advice_seeking = medication/dose/treatment. diagnosis_seeking = asking for a condition/diagnosis. unrelated_task = coding, homework, trivia, etc. confused_by_question = the person says they don't understand, are confused by, or are pushing back on the companion's own last question or reflection (e.g. 'I don't understand what you mean', 'what does that even mean', 'that question doesn't make sense', 'huh?'). Do not use this for general life confusion unrelated to the companion's last message. in_scope = normal supportive conversation.";
+async function classify(latestUserText){const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");try{const raw=await callGroq(CLASSIFY_SYSTEM,[{role:"user",content:"Latest user message:\n"+latestUserText+"\n\nRecent context:\n"+recentContext}],"classifier");const parsed=safeParseJSON(raw);if(parsed&&parsed.risk&&parsed.scope)return parsed}catch(e){}return{risk:"none",scope:"in_scope"}}
+// Turns classify()'s scope/risk verdict into the one-turn instruction the main
+// prompt used to give itself when it was self-checking. Built in JS now, not
+// baked into the static (cached) prompt, since it only applies some turns.
+const SCOPE_NOTES={
+  medical_advice_seeking:"SCOPE: medical_advice_seeking — explain briefly this is outside this chat and steer back to how they are feeling.",
+  diagnosis_seeking:"SCOPE: diagnosis_seeking — do not name or suggest a diagnosis; explain this is outside this chat and steer back to their experience.",
+  unrelated_task:"SCOPE: unrelated_task — decline briefly and steer back to how they are doing.",
+  confused_by_question:"SCOPE: confused_by_question — do not ask another abstract or meta question about their confusion. Either drop the question and reflect back something concrete and simple in their own words, or ask one very plain, concrete question tied to something specific they already told you."
+};
+function scopeDirectiveFor(cls){
+  if(cls.scope==="confused_by_question"&&consecutiveConfusionTurns>=1){
+    return "SCOPE: confused_by_question (already happened once) — do not reflect the confusion again; instead pick one concrete thing they already told you and turn it into a single simple, closed, easy-to-answer next step.";
+  }
+  if(SCOPE_NOTES[cls.scope])return SCOPE_NOTES[cls.scope];
+  if(cls.risk==="elevated_distress")return "RISK: elevated_distress — prioritize warmth and validation; don't suggest an activity.";
+  return "";
+}
+const EVALUATOR_RULES="Judge: no unsolicited advice unless explicitly asked; no diagnosis/clinical language; no medication/treatment recommendations; warm and validating; no unrelated tasks; no parasocial claims; no unearned complex reflection; no fabricated detail. fabricated_detail = the reply references a specific activity, object, event, or detail that the person did not actually say, even loosely — check the recent conversation provided, not just the last message. Respond ONLY JSON: {\"pass\":true|false,\"issue\":null|\"unsolicited_advice\"|\"diagnosis_language\"|\"medication_mention\"|\"low_empathy\"|\"out_of_scope\"|\"parasocial_overclaim\"|\"unearned_complex_reflection\"|\"fabricated_detail\"}";
+const EVALUATOR_SYSTEM="You are a strict output evaluator for a supportive, non-clinical AI companion reply. "+EVALUATOR_RULES;
+// Used only for the second-opinion audit call. Qwen 9B is small and over-flags
+// on anything needing real judgment — this call is deliberately told that its
+// own flag is a hint to look closely, not a verdict to rubber-stamp, since the
+// model running this audit is more capable than the one that raised the flag.
+const AUDIT_SYSTEM="You are the second, more careful review of a reply that a much smaller model (Qwen 9B) already flagged as a possible issue. Qwen 9B can only reliably catch obvious problems — on anything requiring real judgment (is this actually advice vs. a validating reflection with a question, is the empathy actually low, is a reflection actually unearned, is a detail actually fabricated, does this actually name a diagnosis, is this actually an overclaimed relationship) it produces a lot of false flags. You are more capable than it — do not treat its flag as ground truth. Judge the reply fresh, independently, using your own better judgment, and only agree with the flag if you would genuinely raise it yourself, looking at the reply cold. "+EVALUATOR_RULES;
+// Independent of the dropdown — the evaluator is a fixed, cheap check regardless
+// of which model is generating the reply. Known risk, accepted deliberately: a
+// small model may pass things a stronger one would catch. The existing retry +
+// deterministic checks + fallback are the safety net if it does.
+const EVALUATOR_MODEL="qwen/qwen3.5-9b";
+async function evaluateReply(userText,draftReply){try{const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply}],"evaluator",undefined,undefined,EVALUATOR_MODEL,"none");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){}return{pass:true,issue:null}}
+// Quick replies are their own small, cheap, JSON-mode call now — separated out
+// so the main call has nothing left to forget (no REPLY: *and* QUICK_REPLIES:
+// competing for its attention). Fired only when it's actually worth asking, and
+// never allowed to delay or reshape the main reply, which is already on screen
+// by the time this resolves.
+const QUICK_REPLY_MODEL="qwen/qwen3.5-9b";
+const QUICK_REPLY_SYSTEM="Given a supportive companion's reply and recent context, suggest up to 3 short quick-reply button options the user could tap to answer — a few words each, answers only, never questions. If nothing fits well, return an empty list. Respond ONLY JSON: {\"quick_replies\":[\"...\",\"...\"]}";
+// Chips are dropped if this call takes longer than the main reply has already
+// been on screen — a button popping in late reads as broken, not helpful.
+const QUICK_REPLY_STALE_MS=1000;
+// Consecutive turns quick replies were actually SHOWN (not just requested) —
+// reset to 0 whenever a turn ends without chips, for any reason.
+let quickReplyStreak=0;
+// #1: only worth asking if the reply actually posed a question. #2: not three
+// turns of chips in a row (streak already at 2 → this would-be 3rd is skipped).
+function shouldOfferQuickReplies(replyText){
+  if(!replyText.includes("?"))return false;
+  if(quickReplyStreak>=2)return false;
+  return true;
+}
+async function fetchQuickReplies(replyText){
+  const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
+  try{
+    const raw=await callGroq(QUICK_REPLY_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nCompanion's reply:\n"+replyText}],"quick_replies",undefined,undefined,QUICK_REPLY_MODEL,"none");
+    const parsed=safeParseJSON(raw);
+    if(parsed&&Array.isArray(parsed.quick_replies))return parsed.quick_replies.filter(qr=>qr&&qr.trim()).slice(0,3);
+  }catch(e){}
+  return [];
+}
+// Fire-and-forget: never awaited by the main flow, never blocks sendBtn from
+// re-enabling. `row` is the already-displayed reply bubble to attach chips to;
+// `myGeneration` guards against a late result landing after a newer message
+// has already started (so an old turn can't corrupt the current streak count
+// or attach stale chips to a bubble that's no longer the latest one).
+function maybeAttachQuickReplies(row,replyText,myGeneration){
+  if(!shouldOfferQuickReplies(replyText)){quickReplyStreak=0;return}
+  const _t0=performance.now();
+  fetchQuickReplies(replyText).then(list=>{
+    const elapsed=performance.now()-_t0;
+    if(myGeneration!==replyGeneration||elapsed>QUICK_REPLY_STALE_MS||!list.length){
+      console.log("[Sukoon] quick replies discarded — stale, superseded, or empty. elapsed:",Math.round(elapsed),"ms");
+      quickReplyStreak=0;
+      return;
+    }
+    quickReplyStreak=appendQuickReplies(row,list)?quickReplyStreak+1:0;
+  });
+}
+// Qwen 9B is small enough that only near-keyword-level checks are reliable —
+// medication_mention and out_of_scope are close to topic detection, so they
+// still block and retry immediately. Everything else needs real interpretive
+// judgment (is this actually a diagnosis-adjacent claim, a fabricated detail,
+// an overclaimed relationship, unsolicited advice, low empathy, an unearned
+// reflection?) — exactly where a 9B model is unreliable. Those get deferred:
+// let the reply through, queue a follow-up check with the higher-cost model.
+const COMPLEX_EVALUATOR_ISSUES=new Set(["unsolicited_advice","low_empathy","unearned_complex_reflection","diagnosis_language","parasocial_overclaim","fabricated_detail"]);
+let pendingSteeringNote="";
+async function auditComplexFlag(userText,replyText,issue){
+  try{
+    const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
+    // No model override here — deliberately uses whatever's selected (the
+    // higher-cost model), since this is the second opinion, not the fast pass.
+    const raw=await callGroq(AUDIT_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+replyText+"\n\nQwen 9B flagged this reply for: "+issue}],"evaluator_audit");
+    const parsed=safeParseJSON(raw);
+    if(parsed&&parsed.pass===false&&parsed.issue===issue){
+      pendingSteeringNote="Your previous reply was flagged for "+issue+" on a closer look — this turn, deliberately avoid repeating that pattern.";
+      console.log("[Sukoon] complex-flag CONFIRMED by high-cost audit:",issue);
+    }else{
+      console.log("[Sukoon] complex-flag was a false positive from the cheap evaluator:",issue);
+    }
+  }catch(e){/* fail silently — no steering note, nothing blocks on this */}
+}
+const SAFE_FALLBACK_REPLIES=["I want to make sure I'm actually being helpful here rather than just talking — could you tell me a bit more about what's going on?","Thanks for saying that again — I hear you. Tell me a bit more, in your own words, whenever you're ready.","I don't want to just repeat myself here. What feels most important to say about this right now?"];
+let lastFallbackText=null;
+function pickFallbackReply(){const pool=SAFE_FALLBACK_REPLIES.filter(r=>r!==lastFallbackText);const choice=pool[Math.floor(Math.random()*pool.length)];lastFallbackText=choice;return choice}
+const EXTRACT_SYSTEM="Extract 1-3 short factual memory notes from this conversation that would help a supportive, non-clinical companion continue naturally in a future session. Each note under 12 words, factual. Do NOT include self-harm, suicide, or crisis content. Respond ONLY with compact JSON: {\"notes\":[\"...\",\"...\"]}";
+async function extractMemory(){if(!memoryEnabled)return;const recent=history.slice(-10);if(recent.length<2)return;try{const raw=await callGroq(EXTRACT_SYSTEM,recent,"memory");const parsed=safeParseJSON(raw);const notes=parsed&&Array.isArray(parsed.notes)?parsed.notes:null;if(notes&&notes.length){memoryFacts=notes.concat(memoryFacts).filter((v,i,a)=>a.indexOf(v)===i).slice(0,12);await saveMemory(memoryFacts)}}catch(e){}}
+function parseReplyPlain(raw){
+  // No REPLY: label required anymore — the prompt just asks for plain text.
+  // Still stripped defensively if it shows up out of old habit, but its
+  // absence is no longer treated as a failure.
+  const reply=(raw||"").replace(/^REPLY:\s*/i,"").trim();
+  return {reply:reply||(raw||"").trim()};
+}
+// Keep safety/scope handling and local memory, but make the tested JSX prompt the
+// sole conversation policy used for main and retry replies.
+function buildCanonicalSystemPrompt(contextNote){
+  lastCandidateActivity=null;
+  return buildConversationPrompt({
+    memoryFacts: memoryEnabled ? memoryFacts.slice(0,5) : [],
+    scopeDirective: contextNote
+  });
+}
+async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;const myGeneration=++replyGeneration;document.querySelector(".app").classList.add("compact");clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;
+if(userTurnCount===1){const n=normalise(text);if(VENT_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="vent"}
+if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();
+// Standalone classify() call again — decides risk/scope BEFORE generation, so a
+// crisis message never spends a generation call at all, and main is never asked
+// to judge its own risk/scope (that self-check was dropped from the prompt).
+// Skipped for quick-reply chip taps — those options are pre-vetted, model-chosen
+// text, not free-form input, so there's nothing new to classify.
+const cls=opts.skipClassify?{risk:"none",scope:"in_scope"}:await classify(text);
+if(cls.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
+let ventCheckNote="";
+if(initialIntent==="vent"&&!ventCheckInDone&&userTurnCount>=VENT_CHECKIN_AT_TURN){
+  ventCheckNote="They said early on they just wanted to vent — that's been the assumed goal. It's been a few turns now: this turn, naturally check in, genuinely open to either answer — are they looking to keep talking it through, or is there something they're trying to figure out or do about it? Don't push toward solutions, just ask.";
+  ventCheckInDone=true;
+}
+const contextNote=[
+  scopeDirectiveFor(cls),
+  pendingSteeringNote,
+  ventCheckNote
+].filter(Boolean).join(" ");
+if(cls.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
+if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
+try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseReplyPlain(raw);console.log("[Sukoon] parsed reply:",parsed);
+lastCandidateActivity=(cls.risk!=="elevated_distress"&&cls.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
+let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);
+if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
+else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
+if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply()};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply()}}}
+removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});const replyRow=addBubble("assistant",parsed.reply,chip,null);if(!isFallback){codeCompanionTurn(text,parsed.reply);maybeAttachQuickReplies(replyRow,parsed.reply,myGeneration)}else{quickReplyStreak=0}
+}catch(e){removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
+if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
+function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
+moreBtn.addEventListener("click",e=>{e.stopPropagation();const isOpen=morePanel.classList.toggle("open");moreBtn.setAttribute("aria-expanded",isOpen?"true":"false")});
+document.addEventListener("click",e=>{if(morePanel.classList.contains("open")&&!morePanel.contains(e.target)&&e.target!==moreBtn){morePanel.classList.remove("open");moreBtn.setAttribute("aria-expanded","false")}});
+memoryBtn.addEventListener("click",()=>{morePanel.classList.remove("open");moreBtn.setAttribute("aria-expanded","false")});
+function renderMemoryList(){memoryListEl.innerHTML="";if(!memoryFacts.length){memoryListEl.innerHTML="<p class='memory-empty'>Nothing saved yet — Sukoon remembers little things as you talk, so it's less repetitive next time.</p>";return}memoryFacts.forEach(f=>{const li=document.createElement("li");li.textContent=f;memoryListEl.appendChild(li)})}
+memoryBtn.addEventListener("click",()=>{renderMemoryList();memoryToggle.checked=memoryEnabled;memoryOverlay.classList.add("open")});closeMemoryBtn.addEventListener("click",()=>memoryOverlay.classList.remove("open"));memoryToggle.addEventListener("change",async()=>{memoryEnabled=memoryToggle.checked;await saveMemoryEnabled(memoryEnabled)});forgetBtn.addEventListener("click",async()=>{memoryFacts=[];await saveMemory([]);renderMemoryList()});
+const debugOverlay=document.getElementById("debug-overlay"),debugBody=document.getElementById("debug-body");
+function metricRow(label,value,key,isPct){let display="—",statusClass="na",statusText="no data";if(value!==null&&value!==undefined){display=isPct?(value*100).toFixed(0)+"%":value.toFixed(2);statusText=bandStatus(key,value);statusClass=statusText==="in band"?"ok":"off"}const cfg=MI_TARGETS[key],targetDisp=isPct?(cfg.target*100).toFixed(0)+"%":cfg.target.toFixed(2);return"<div class='metric-row'><span>"+label+"<br><span style='font-size:.7rem;color:var(--ink-soft)'>target "+targetDisp+" ±"+(cfg.tolerance*100)+"%</span></span><span><span class='val'>"+display+"</span><span class='status "+statusClass+"'>"+statusText+"</span></span></div>"}
+function renderDebugPanel(){const s=computeMetrics(sessionTally),a=computeMetrics(aggregateTally);debugBody.innerHTML="<div class='metric-block'><h4>This session ("+s.turns+" coded turns)</h4>"+metricRow("Reflection : Question",s.rq_ratio,"rq_ratio",false)+metricRow("Open questions",s.pct_open,"pct_open",true)+metricRow("Complex reflections",s.pct_complex,"pct_complex",true)+"<div class='metric-row'><span>Advice given</span><span class='val'>"+s.advice+"</span></div><p class='metric-note'>Steering starts after "+MIN_CODED_TURNS_BEFORE_STEERING+" coded turns.</p></div><div class='metric-block'><h4>All-time ("+a.turns+" turns)</h4><div class='metric-row'><span>Reflection : Question</span><span class='val'>"+(a.rq_ratio===null?"—":a.rq_ratio.toFixed(2))+"</span></div><div class='metric-row'><span>Open questions</span><span class='val'>"+(a.pct_open===null?"—":(a.pct_open*100).toFixed(0)+"%")+"</span></div><div class='metric-row'><span>Complex reflections</span><span class='val'>"+(a.pct_complex===null?"—":(a.pct_complex*100).toFixed(0)+"%")+"</span></div><div class='metric-row'><span>Advice given</span><span class='val'>"+a.advice+"</span></div></div><div class='metric-block'><h4>Raw counts (session)</h4><div class='metric-row'><span>Simple reflections</span><span class='val'>"+sessionTally.simple_reflection+"</span></div><div class='metric-row'><span>Complex reflections</span><span class='val'>"+sessionTally.complex_reflection+"</span></div><div class='metric-row'><span>Open questions</span><span class='val'>"+sessionTally.open_question+"</span></div><div class='metric-row'><span>Closed questions</span><span class='val'>"+sessionTally.closed_question+"</span></div><div class='metric-row'><span>Other</span><span class='val'>"+sessionTally.other+"</span></div></div>"}
+let orbTaps=0,orbTapTimer=null;document.getElementById("mascot-avatar").addEventListener("click",()=>{orbTaps++;clearTimeout(orbTapTimer);orbTapTimer=setTimeout(()=>{orbTaps=0},1200);if(orbTaps>=5){orbTaps=0;renderDebugPanel();debugOverlay.classList.add("open")}});document.getElementById("close-debug-btn").addEventListener("click",()=>debugOverlay.classList.remove("open"));document.getElementById("reset-agg-btn").addEventListener("click",resetAggregate);
+(async function init(){memoryEnabled=await loadMemoryEnabled();memoryFacts=memoryEnabled?await loadMemory():[];await loadAggregate();aggregateSessions++;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:aggregateSessions}))}catch(e){}if(memoryFacts.length)addBubble("assistant","Hi again — glad you're back. Last time, "+memoryFacts[0].toLowerCase().replace(/\.$/,"")+" came up. Want to pick up from there, or start fresh?",null,["Pick up from there","Let's start fresh"]);else addQuickRepliesOnly(["Just want to vent","Something specific happened","Not sure, just checking in"])})();
+</script>
+</body>
+</html>  .app.compact .tagline{font-size:.8rem;font-weight:500;color:var(--ink-soft);margin-top:2px}
+  .app.compact .tagline .leaf{display:inline-flex}
+  .hero{text-align:center;padding:22px 28px 20px}
+  .hero h2{font-family:'Inter',sans-serif;font-weight:700;font-size:1.3rem;color:var(--heading-green);margin:0 0 4px}
+  .hero p{font-size:1.02rem;color:var(--ink);margin:0;font-weight:500}
+  .hero .hero-divider{display:flex;align-items:center;gap:10px;margin:16px auto 0;max-width:180px}
+  .hero .hero-divider span{flex:1;height:1px;background:var(--border)}
+  .hero .hero-divider svg{flex-shrink:0;color:var(--indigo-mid)}
+  .tagline-footer{text-align:center;font-size:.7rem;font-weight:600;letter-spacing:2px;color:#8C5324;text-transform:uppercase;padding:2px 16px 14px;display:flex;align-items:center;justify-content:center;gap:6px}
+  .app.compact .tagline-footer{display:none}
+  .chat{flex:1;overflow-y:auto;padding:20px 16px 10px;display:flex;flex-direction:column;gap:12px;background:var(--mist)}.bubble-row{display:flex;flex-direction:column}.bubble-row.user{align-items:flex-end}.bubble-row.companion{align-items:flex-start;position:relative;padding-left:34px}
+  .bubble-row.companion::before{content:'';position:absolute;top:0;left:0;width:28px;height:28px;background:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20120%2090%22%3E%3Cdefs%3E%3CradialGradient%20id%3D%22cg%22%20cx%3D%2238%25%22%20cy%3D%2226%25%22%20r%3D%2280%25%22%3E%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%23FCEFDA%22/%3E%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23E6C89B%22/%3E%3C/radialGradient%3E%3C/defs%3E%3Cellipse%20cx%3D%2262%22%20cy%3D%2267%22%20rx%3D%2238%22%20ry%3D%229%22%20fill%3D%22%23D9B98C%22%20opacity%3D%220.35%22/%3E%3Ccircle%20cx%3D%2234%22%20cy%3D%2246%22%20r%3D%2220%22%20fill%3D%22url%28%23cg%29%22/%3E%3Ccircle%20cx%3D%2262%22%20cy%3D%2229%22%20r%3D%2226%22%20fill%3D%22url%28%23cg%29%22/%3E%3Ccircle%20cx%3D%2290%22%20cy%3D%2246%22%20r%3D%2218%22%20fill%3D%22url%28%23cg%29%22/%3E%3Cellipse%20cx%3D%2262%22%20cy%3D%2258%22%20rx%3D%2244%22%20ry%3D%2222%22%20fill%3D%22url%28%23cg%29%22/%3E%3Cellipse%20cx%3D%2244%22%20cy%3D%2260%22%20rx%3D%224.2%22%20ry%3D%222.6%22%20fill%3D%22%23F2A97E%22%20opacity%3D%220.4%22/%3E%3Cellipse%20cx%3D%2280%22%20cy%3D%2260%22%20rx%3D%224.2%22%20ry%3D%222.6%22%20fill%3D%22%23F2A97E%22%20opacity%3D%220.4%22/%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2255%22%20r%3D%223.4%22%20fill%3D%22%233A332B%22/%3E%3Ccircle%20cx%3D%2274%22%20cy%3D%2255%22%20r%3D%223.4%22%20fill%3D%22%233A332B%22/%3E%3Cpath%20d%3D%22M54%2C63%20Q62%2C68%2070%2C63%22%20stroke%3D%22%233A332B%22%20stroke-width%3D%222.4%22%20fill%3D%22none%22%20stroke-linecap%3D%22round%22/%3E%3C/svg%3E") center/contain no-repeat}
+  .bubble{max-width:78%;padding:12px 16px;border-radius:var(--radius);font-size:1rem;line-height:1.55}.bubble-row.companion .bubble{background:var(--paper);border-bottom-left-radius:6px;color:var(--ink)}.bubble-row.user .bubble{background:var(--user-bubble);color:var(--user-bubble-text);border-bottom-right-radius:6px;font-weight:500}
+  .chip{margin-top:6px;font-size:.76rem;background:var(--sage-soft);color:#3E5347;border:1px solid var(--sage);border-radius:20px;padding:5px 12px;max-width:78%}.chip b{font-weight:600}
+  .quick-replies{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;max-width:92%}.quick-chip{background:#fff;border:1.5px solid var(--indigo-mid);color:var(--indigo-mid);border-radius:20px;padding:8px 14px;min-height:36px;font-size:.85rem;cursor:pointer;font-family:'Inter',sans-serif;transition:background .15s ease,color .15s ease}.quick-chip:hover{background:var(--indigo-mid);color:#fff}.quick-chip:active{transform:scale(.96)}
+  .typing{display:flex;gap:4px;padding:13px 15px}.typing span{width:6px;height:6px;background:var(--ink-soft);border-radius:50%;animation:bounce 1.2s infinite ease-in-out}.typing span:nth-child(2){animation-delay:.15s}.typing span:nth-child(3){animation-delay:.3s}@keyframes bounce{0%,60%,100%{transform:translateY(0);opacity:.5}30%{transform:translateY(-4px);opacity:1}}
+  .crisis-card{max-width:88%;background:var(--clay-soft);border:1px solid var(--clay);border-radius:var(--radius);padding:14px 16px;font-size:.94rem;line-height:1.55}.crisis-card h3{margin:0 0 6px;font-family:'Inter',sans-serif;font-weight:600;font-size:1rem;color:#7A3F2E}.crisis-card p{margin:0 0 8px;color:#5A3327}.crisis-card .lines{display:flex;flex-direction:column;gap:5px;margin-bottom:8px}.crisis-card .line{background:#fff;border-radius:10px;padding:11px 12px;min-height:44px;display:flex;justify-content:space-between;align-items:center;font-size:.9rem}.crisis-card .line strong{color:var(--indigo-deep)}.crisis-card .line a{color:var(--marigold-deep);text-decoration:none;font-weight:600}.crisis-card .close-note{font-size:.78rem;color:#7A5A50;margin:0}
+  .input-bar{flex-shrink:0;display:flex;align-items:flex-end;gap:8px;padding:10px 14px;background:var(--mist);border-top:1px solid var(--border)}textarea#composer{flex:1;resize:none;border:1px solid var(--border);border-radius:22px;padding:12px 16px;font-family:'Inter',sans-serif;font-size:16px;line-height:1.4;max-height:110px;background:#fff;color:var(--ink);outline:none}textarea#composer:focus{border-color:var(--marigold)}textarea#composer::placeholder{color:var(--ink-soft)}#send-btn{background:var(--indigo-mid);color:#fff;border:none;border-radius:14px;width:44px;height:44px;flex-shrink:0;cursor:pointer;font-size:1.1rem;display:flex;align-items:center;justify-content:center;transition:transform .1s ease,background .15s ease}#send-btn:hover{background:#324D25}#send-btn:active{transform:scale(.94)}#send-btn:disabled{opacity:.5;cursor:default}
+  .disclaimer{text-align:center;font-size:.72rem;color:var(--ink-soft);padding:3px 16px 10px;flex-shrink:0}
+  .modal-overlay{position:absolute;inset:0;background:rgba(35,32,72,.45);display:none;align-items:center;justify-content:center;z-index:10;padding:20px}.modal-overlay.open{display:flex}.modal{background:#fff;border-radius:var(--radius);padding:20px;max-width:400px;width:100%;max-height:80vh;overflow-y:auto}.modal h2{font-family:'Inter',sans-serif;font-weight:600;font-size:1.1rem;margin:0 0 4px}.modal .sub{font-size:.8rem;color:var(--ink-soft);margin:0 0 14px}.memory-list{list-style:none;padding:0;margin:0 0 16px;display:flex;flex-direction:column;gap:6px}.memory-list li{background:var(--mist);border-radius:10px;padding:8px 12px;font-size:.85rem}.memory-empty{font-size:.85rem;color:var(--ink-soft);font-style:italic}.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-top:1px solid var(--border);font-size:.85rem}.switch{position:relative;width:40px;height:22px;flex-shrink:0}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:var(--border);border-radius:22px;cursor:pointer;transition:.15s}.slider:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}input:checked+.slider{background:var(--sage)}input:checked+.slider:before{transform:translateX(18px)}.modal-actions{display:flex;gap:8px;margin-top:14px}
+  .metric-block{margin-bottom:14px}.metric-block h4{margin:0 0 6px;font-size:.8rem;text-transform:uppercase;letter-spacing:.5px;color:var(--ink-soft);font-weight:600}.metric-row{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--mist);border-radius:8px;margin-bottom:4px;font-size:.82rem}.metric-row .val{font-variant-numeric:tabular-nums;font-weight:600}.status{font-size:.7rem;padding:2px 7px;border-radius:10px;margin-left:6px}.status.ok{background:var(--sage-soft);color:#3E5347}.status.off{background:var(--clay-soft);color:#7A3F2E}.status.na{background:var(--border);color:var(--ink-soft)}.metric-note{font-size:.72rem;color:var(--ink-soft);margin:6px 0 0;line-height:1.4}.btn{flex:1;border:none;border-radius:12px;padding:10px;font-size:.85rem;cursor:pointer;font-family:'Inter',sans-serif;font-weight:500}.btn-ghost{background:var(--mist);color:var(--ink)}.btn-danger{background:var(--clay-soft);color:#7A3F2E}.btn-primary{background:var(--marigold);color:var(--indigo-deep)}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+  #model-select{width:100%;background:#fff;border:1px solid var(--border);color:var(--ink);font-size:16px;font-family:'Inter',sans-serif;padding:9px 10px;border-radius:10px;cursor:pointer}
+  #model-select option{color:var(--ink);background:#fff}
+  .more-wrap{position:relative}
+  .icon-btn.icon-only{width:40px;height:40px;padding:0;border-radius:50%;justify-content:center}
+  .more-panel{position:absolute;top:calc(100% + 8px);right:0;background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(64,56,46,.22);padding:10px;min-width:200px;max-width:calc(100vw - 32px);display:none;z-index:30}
+  .more-panel.open{display:block}
+  .more-section{padding:4px 6px 12px;border-bottom:1px solid var(--border);margin-bottom:6px}
+  .more-label{display:block;font-size:.7rem;color:var(--ink-soft);margin-bottom:6px;font-weight:500}
+  .more-section select{width:100%;border:1px solid var(--border);border-radius:10px;padding:9px 10px;font-family:'Inter',sans-serif;font-size:1rem;color:var(--ink);background:#fff}
+  .more-item{width:100%;display:flex;align-items:center;justify-content:space-between;background:none;border:none;padding:10px 6px;font-family:'Inter',sans-serif;font-size:.9rem;color:var(--ink);cursor:pointer;border-radius:10px;min-height:40px}
+  .more-item:hover{background:var(--mist)}
+  .more-item .chev{color:var(--ink-soft);flex-shrink:0}
+  @media (max-width:380px){.icon-btn:not(.icon-only){font-size:.7rem;padding:8px 10px}}
+</style>
+</head>
+<body>
+<div class="app">
+<header><div class="avatar-wrap"><div class="avatar-ring" id="mascot-avatar"><svg viewBox="0 0 120 90"><defs><radialGradient id="cg" cx="38%" cy="26%" r="80%"><stop offset="0%" stop-color="#FCEFDA"/><stop offset="100%" stop-color="#E6C89B"/></radialGradient></defs><ellipse cx="62" cy="67" rx="38" ry="9" fill="#D9B98C" opacity="0.35"/><circle cx="34" cy="46" r="20" fill="url(#cg)"/><circle cx="62" cy="29" r="26" fill="url(#cg)"/><circle cx="90" cy="46" r="18" fill="url(#cg)"/><ellipse cx="62" cy="58" rx="44" ry="22" fill="url(#cg)"/><ellipse cx="44" cy="60" rx="4.2" ry="2.6" fill="#F2A97E" opacity="0.4"/><ellipse cx="80" cy="60" rx="4.2" ry="2.6" fill="#F2A97E" opacity="0.4"/><g class="mascot-eyes"><circle cx="50" cy="55" r="3.4" fill="#3A332B"/><circle cx="74" cy="55" r="3.4" fill="#3A332B"/></g><path d="M54,63 Q62,68 70,63" stroke="#3A332B" stroke-width="2.4" fill="none" stroke-linecap="round"/></svg></div><span class="status-dot"></span></div><div class="header-text"><h1>Sukoon</h1><p class="tagline"><svg class="leaf" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#3E5C2C" stroke-width="2" stroke-linecap="round"><path d="M12 3C7 3 4 7 4 12c0 5 4 8 8 8 0-6 0-11 5-15-3 0-9 0-5 8"/></svg>Always here to listen</p><p class="header-sub">Talk about sleep, daily stress, anxiety, or any other problem</p></div><div class="header-actions"><button class="icon-btn" id="help-btn" type="button">Need help now</button><div class="more-wrap"><button class="icon-btn icon-only" id="more-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="More options"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg></button><div class="more-panel" id="more-panel"><div class="more-section"><span class="more-label">Test model</span><select id="model-select" title="Test model"></select></div><button class="more-item" id="memory-btn" type="button"><span>Memory</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></button></div></div></div></header>
+<div class="chat" id="chat"><div class="hero"><h2>Hi, I'm Sukoon.</h2><p>What's on your mind today?</p><div class="hero-divider"><span></span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3C7 3 4 7 4 12c0 5 4 8 8 8 0-6 0-11 5-15-3 0-9 0-5 8"/></svg><span></span></div></div></div>
+<div class="input-bar"><textarea id="composer" rows="1" placeholder="Type here."></textarea><button id="send-btn" type="button" aria-label="Send"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18l5-7 3 3 4-6 6 10H3z" fill="#fff" stroke="none"/><path d="M14 9l4-4m0 0h-3.2m3.2 0v3.2"/></svg></button></div>
+<p class="disclaimer">Sukoon offers supportive conversation only — it's not a substitute for professional care.</p>
+<p class="tagline-footer"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 20l6-10 4 6 3-4 5 8H3z"/></svg>Breathe · Pause · Be kind</p>
+<div class="modal-overlay" id="memory-overlay"><div class="modal"><h2>What Sukoon remembers</h2><p class="sub">Private to you. A few short notes from past chats, so conversations don't start from zero.</p><ul class="memory-list" id="memory-list"></ul><div class="toggle-row"><span>Remember future conversations</span><label class="switch"><input type="checkbox" id="memory-toggle"><span class="slider"></span></label></div><div class="modal-actions"><button class="btn btn-danger" id="forget-btn" type="button">Forget everything</button><button class="btn btn-primary" id="close-memory-btn" type="button">Close</button></div></div></div>
+<div class="modal-overlay" id="debug-overlay"><div class="modal"><h2>MI fidelity (internal)</h2><p class="sub">Hidden diagnostic view — not shown to users. Opened by tapping the orb 5 times.</p><div id="debug-body"></div><div class="modal-actions"><button class="btn btn-danger" id="reset-agg-btn" type="button">Reset all-time</button><button class="btn btn-primary" id="close-debug-btn" type="button">Close</button></div></div></div>
+</div>
+<script type="module">
+import { buildConversationPrompt } from "./conversation/prompt.js";
+// Editable via the header dropdown; persisted in localStorage so it survives reloads.
+// Every model here is called through OpenRouter with the same request shape, so
+// swapping models is just picking a different slug — no other code changes needed.
+const MODEL_OPTIONS = [
+  { id: "anthropic/claude-sonnet-5",    label: "Claude Sonnet 5",     reasoning: null  },
+  { id: "qwen/qwen3.8-2.4t-a95b",       label: "Qwen3.8 2.4T A95B",   reasoning: "low" },
+  { id: "deepseek/deepseek-v4-flash",   label: "DeepSeek V4 Flash",   reasoning: null, disableThinking: true },
+  { id: "z-ai/glm-5.2",                 label: "GLM-5.2",             reasoning: null  },
+  { id: "deepseek/deepseek-v4-pro",     label: "DeepSeek V4 Pro",     reasoning: null, disableThinking: true },
+  { id: "moonshotai/kimi-k2.6",         label: "Kimi K2.6",           reasoning: null  },
+  { id: "moonshotai/kimi-k3",           label: "Kimi K3",             reasoning: "low" },
+  { id: "qwen/qwen3.6-plus",            label: "Qwen3.6 Plus",        reasoning: null  },
+  { id: "anthropic/claude-opus-4.8",    label: "Claude Opus 4.8",     reasoning: null  },
+  { id: "x-ai/grok-4.6",                label: "Grok 4.6",            reasoning: null  },
+];
+function loadSelectedModel(){return localStorage.getItem("sukoon_model")||MODEL_OPTIONS[0].id}
+function saveSelectedModel(id){try{localStorage.setItem("sukoon_model",id)}catch(e){}}
+let SELECTED_MODEL=loadSelectedModel();
+function currentModelConfig(){return MODEL_OPTIONS.find(m=>m.id===SELECTED_MODEL)||MODEL_OPTIONS[0]}
+// One id per page load/session — lets OpenRouter route repeat calls in this
+// conversation to the same provider endpoint, which is what keeps a cache warm.
+const SESSION_ID=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random());
+// Max turns (user+assistant messages) sent to the model on the main/retry calls.
+// Was: full unbounded `history`, so token cost per call grew every turn all session.
+const HISTORY_WINDOW = 16;
+const ACTIVITIES=[
+{id:"sleep_hygiene",category:"sleep",title:"Sleep hygiene reset",duration:"5 min read",desc:"A few small habit shifts that make falling asleep easier."},
+{id:"stimulus_control",category:"sleep",title:"Stimulus control basics",duration:"5 min",desc:"Re-teaching your bed to mean 'sleep', not 'lying awake'."},
+{id:"winddown_breath",category:"sleep",title:"Wind-down breathing",duration:"4 min audio",desc:"A slow breathing pattern to settle the body before bed."},
+{id:"small_pleasant",category:"mood",title:"One small pleasant thing",duration:"10 min",desc:"A tiny, doable activity just for the enjoyment of it."},
+{id:"small_win",category:"mood",title:"One small win",duration:"10 min",desc:"A tiny task that gives a real sense of finishing something."},
+{id:"worry_dump",category:"anxiety",title:"Worry dump",duration:"5 min",desc:"Getting the looping worries out of your head and onto paper."},
+{id:"worry_cycle",category:"anxiety",title:"Naming the worry cycle",duration:"6 min read",desc:"Seeing the pattern that keeps worry feeding itself."},
+{id:"slow_breath_reset",category:"panic",title:"Slow breath reset",duration:"3 min audio",desc:"A short breathing exercise for when panic spikes."},
+{id:"ground_yourself",category:"panic",title:"Ground yourself",duration:"3 min",desc:"Using your senses to come back into the room."},
+{id:"three_step_problem_solving",category:"stress",title:"Problem-solving in 3 steps",duration:"8 min",desc:"Clarify, brainstorm, pick one small next step."},
+{id:"boundary_checkin",category:"stress",title:"Boundary check-in",duration:"6 min",desc:"A short reflection on where you need to say no."},
+{id:"i_statement",category:"relationships",title:"Try an I-statement",duration:"5 min",desc:"A simple way to say a hard thing without it turning into a fight."}
+];
+const CATEGORY_KEYWORDS={sleep:["sleep","insomnia","cant sleep","can't sleep","awake at night","tired all day","wide awake"],mood:["sad","low mood","down","depress","hopeless","empty","numb","no motivation"],anxiety:["anxious","anxiety","worry","worried","nervous","overthinking","racing thoughts"],panic:["panic","panic attack","cant breathe","can't breathe","heart racing","chest tight"],stress:["stress","overwhelmed","burnt out","burnout","deadline","too much to do"],relationships:["relationship","partner","fight","argument","family conflict","breakup","boyfriend","girlfriend","husband","wife"]};
+const CRISIS_PATTERNS=["suicide","kill myself","end my life","ending my life","want to die","dont want to live","don't want to live","no reason to live","better off dead","self harm","self-harm","hurt myself","hurting myself","cant go on","can't go on","no way out","end it all"];
+function normalise(text){return text.toLowerCase().replace(/[^a-z0-9' ]/g," ")}
+function isCrisisMessage(text){const n=normalise(text);return CRISIS_PATTERNS.some(p=>n.includes(p.replace("'","")))}
+function pickActivity(text,usedIds){const n=normalise(text);let bestCat=null,bestScore=0;for(const cat in CATEGORY_KEYWORDS){const hits=CATEGORY_KEYWORDS[cat].filter(k=>n.includes(normalise(k))).length;if(hits>bestScore){bestScore=hits;bestCat=cat}}if(!bestCat)return null;const pool=ACTIVITIES.filter(a=>a.category===bestCat),fresh=pool.filter(a=>!usedIds.has(a.id));return (fresh.length?fresh:pool)[0]||null}
+
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+// Right-sized output budgets per call type — was hardcoded to 1000 for every call,
+// including ones that only ever return a 10-token JSON object. This alone was the
+// single biggest driver of the TPM rate-limit hit, since "requested" tokens count
+// against the same per-minute budget as prompt tokens.
+const TOKEN_BUDGETS={classifier:150,evaluator:120,evaluator_audit:120,coder:100,memory:200,main:800,retry:800,quick_replies:80};
+
+async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,overrideModel,overrideReasoning){
+  const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
+  const _t0=performance.now();
+  // overrideModel lets a call (e.g. the evaluator) pin to a specific model
+  // regardless of the dropdown selection. disable_thinking is tied to specific
+  // SELECTED_MODEL entries (currently the DeepSeek ones) so it's deliberately
+  // NOT carried over when overriding — an overridden call should be explicit
+  // about its own reasoning setting via overrideReasoning instead.
+  const modelToUse=overrideModel||SELECTED_MODEL;
+  const reasoningToUse=overrideModel?overrideReasoning:currentModelConfig().reasoning;
+  const disableThinkingToUse=overrideModel?false:!!currentModelConfig().disableThinking;
+  let response;
+  try {
+    response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:modelToUse,max_tokens:budget,plain_text:(stage==="main"||stage==="retry"),reasoning_effort:reasoningToUse,session_id:SESSION_ID,disable_thinking:disableThinkingToUse})});
+  } catch(e) {
+    throw new Error((stage||"AI") + " network error: " + (e && e.message ? e.message : String(e)));
+  }
+  let data;
+  try { data=await response.json(); } catch(e) {
+    throw new Error((stage||"AI") + " returned non-JSON HTTP " + response.status);
+  }
+  if(response.status===400 && !_isRetryAttempt && /failed to (generate|validate) json/i.test((data&&data.error)||"")){
+    // Known occasional model-side miss on strict JSON mode, not a bad prompt —
+    // retry once, fast (this isn't a rate limit, no need for a long backoff).
+    console.warn("[Sukoon]",stage,"hit a JSON-generation miss, retrying once");
+    await sleep(400);
+    return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
+  }
+  if(response.status===429 && !_isRetryAttempt){
+    // Transient rate limit — back off once and retry, instead of failing straight
+    // to the fallback/debug message. The API route forwards a retry-after header when present.
+    const waitSec=Math.min(Math.max((data && data.retryAfter) || 6, 3),20);
+    console.warn("[Sukoon]",stage,"hit 429, backing off",waitSec,"s before one retry");
+    await sleep(waitSec*1000);
+    return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
+  }
+  if(!response.ok) throw new Error((stage||"AI") + " HTTP " + response.status + ": " + (data.error||JSON.stringify(data)));
+  if(!data.text){
+    if(!_isRetryAttempt){
+      // Almost always reasoning tokens eating the whole budget before any visible
+      // text gets written (same shape we found and fixed for DeepSeek) — worth
+      // one automatic retry before treating it as a real failure, same tier as
+      // the 429/400 handling above.
+      console.warn("[Sukoon]",stage,"returned empty text, retrying once");
+      return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
+    }
+    throw new Error((stage||"AI") + " returned empty text");
+  }
+  console.log("[Sukoon] TIMING",stage,"("+modelToUse+")","took",Math.round(performance.now()-_t0),"ms");
+  return data.text;
+}
+const MAX_REPLY_WORDS=70,MAX_READING_GRADE=10,MIN_WORDS_FOR_READING_CHECK=8;
+function wordCount(text){return text.trim().split(/\s+/).filter(Boolean).length}
+function countSyllables(word){word=word.toLowerCase().replace(/[^a-z]/g,"");if(!word)return 0;if(word.length<=3)return 1;word=word.replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/,"");word=word.replace(/^y/,"");const matches=word.match(/[aeiouy]{1,2}/g);return matches?matches.length:1}
 function fleschKincaidGrade(text){const sentences=text.split(/[.!?]+/).map(s=>s.trim()).filter(Boolean),words=text.split(/\s+/).map(w=>w.replace(/[^a-zA-Z']/g,"")).filter(Boolean);if(!words.length)return 0;const sc=Math.max(sentences.length,1),wc=words.length;let syllables=0;words.forEach(w=>syllables+=countSyllables(w));return .39*(wc/sc)+11.8*(syllables/wc)-15.59}
 function extractQuestion(text){const m=text.match(/([^.!?]*\?)/);return m?normalise(m[1]).trim():null}
 function questionSimilarity(a,b){const wa=new Set(a.split(" ").filter(Boolean)),wb=new Set(b.split(" ").filter(Boolean));if(!wa.size||!wb.size)return 0;let overlap=0;wa.forEach(w=>{if(wb.has(w))overlap++});return overlap/new Set([...wa,...wb]).size}
