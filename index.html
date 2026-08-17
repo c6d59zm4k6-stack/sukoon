@@ -133,7 +133,7 @@ function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 // including ones that only ever return a 10-token JSON object. This alone was the
 // single biggest driver of the TPM rate-limit hit, since "requested" tokens count
 // against the same per-minute budget as prompt tokens.
-const TOKEN_BUDGETS={classifier:150,evaluator:120,evaluator_audit:120,coder:100,memory:200,main:800,retry:800};
+const TOKEN_BUDGETS={classifier:150,evaluator:120,evaluator_audit:120,coder:100,memory:200,main:800,retry:800,quick_replies:80};
 
 async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,overrideModel,overrideReasoning){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
@@ -213,6 +213,10 @@ async function loadAggregate(){try{const v=localStorage.getItem("sukoon_mi_aggre
 async function persistAggregate(codes){codes.forEach(c=>{if(c in aggregateTally)aggregateTally[c]++});aggregateTally.turns++;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:aggregateSessions}))}catch(e){}}
 async function resetAggregate(){aggregateTally=emptyTally();aggregateSessions=0;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:0}))}catch(e){}renderDebugPanel()}
 let history=[],memoryFacts=[],memoryEnabled=true,usedActivityIds=new Set(),lastCandidateActivity=null,userTurnCount=0,askedQuestions=[],consecutiveConfusionTurns=0;
+// Bumped at the start of every sendMessage() — lets the async quick-reply
+// fetch tell whether it's still answering the latest turn by the time it
+// resolves, or a newer message has already started (see maybeAttachQuickReplies).
+let replyGeneration=0;
 // Tracked in JS, not left to the model to remember — set once from the very
 // first message, consumed exactly once at the check-in turn. Self-tracked state
 // like this has already shown drift elsewhere (RISK/SCOPE labels, question
@@ -227,7 +231,34 @@ MODEL_OPTIONS.forEach(m=>{const opt=document.createElement("option");opt.value=m
 modelSelectEl.value=SELECTED_MODEL;
 modelSelectEl.addEventListener("change",()=>{SELECTED_MODEL=modelSelectEl.value;saveSelectedModel(SELECTED_MODEL)});
 function scrollToBottom(){chatEl.scrollTop=chatEl.scrollHeight}function clearQuickReplyChips(){document.querySelectorAll(".quick-replies").forEach(el=>el.remove())}
-function addBubble(role,text,chipActivity,quickReplies){const row=document.createElement("div");row.className="bubble-row "+(role==="user"?"user":"companion");const bubble=document.createElement("div");bubble.className="bubble";bubble.textContent=text;row.appendChild(bubble);if(chipActivity){const chip=document.createElement("div");chip.className="chip";chip.title=chipActivity.desc;chip.innerHTML="🧭 Suggested: <b>"+chipActivity.title+"</b> · "+chipActivity.duration;row.appendChild(chip)}if(quickReplies&&quickReplies.length){const wrap=document.createElement("div");wrap.className="quick-replies";quickReplies.slice(0,3).forEach(qr=>{if(!qr||!qr.trim()||qr.includes("?"))return;const btn=document.createElement("button");btn.type="button";btn.className="quick-chip";btn.textContent=qr;btn.addEventListener("click",()=>sendMessage(qr,{skipClassify:true}));wrap.appendChild(btn)});row.appendChild(wrap)}chatEl.appendChild(row);scrollToBottom()}
+// Shared by addBubble (greeting's hardcoded chips) and appendQuickReplies (the
+// async quick-reply model's result) so both render buttons identically.
+function buildQuickReplyChips(quickReplies){
+  if(!quickReplies||!quickReplies.length)return null;
+  const wrap=document.createElement("div");
+  wrap.className="quick-replies";
+  quickReplies.slice(0,3).forEach(qr=>{
+    if(!qr||!qr.trim()||qr.includes("?"))return;
+    const btn=document.createElement("button");
+    btn.type="button";
+    btn.className="quick-chip";
+    btn.textContent=qr;
+    btn.addEventListener("click",()=>sendMessage(qr,{skipClassify:true}));
+    wrap.appendChild(btn);
+  });
+  return wrap.children.length?wrap:null;
+}
+function addBubble(role,text,chipActivity,quickReplies){const row=document.createElement("div");row.className="bubble-row "+(role==="user"?"user":"companion");const bubble=document.createElement("div");bubble.className="bubble";bubble.textContent=text;row.appendChild(bubble);if(chipActivity){const chip=document.createElement("div");chip.className="chip";chip.title=chipActivity.desc;chip.innerHTML="🧭 Suggested: <b>"+chipActivity.title+"</b> · "+chipActivity.duration;row.appendChild(chip)}const qrWrap=buildQuickReplyChips(quickReplies);if(qrWrap)row.appendChild(qrWrap);chatEl.appendChild(row);scrollToBottom();return row}
+// Appends quick-reply chips to an already-displayed bubble, once the separate
+// small-model call resolves — never blocks or delays the main reply itself.
+function appendQuickReplies(row,quickReplies){
+  if(!row||!row.isConnected)return false; // bubble scrolled away/removed — nothing to attach to
+  const qrWrap=buildQuickReplyChips(quickReplies);
+  if(!qrWrap)return false;
+  row.appendChild(qrWrap);
+  scrollToBottom();
+  return true;
+}
 function addQuickRepliesOnly(quickReplies){
   console.log("[Sukoon] addQuickRepliesOnly called with:",quickReplies);
   if(!quickReplies||!quickReplies.length){console.warn("[Sukoon] addQuickRepliesOnly got nothing to render");return}
@@ -282,6 +313,53 @@ const AUDIT_SYSTEM="You are the second, more careful review of a reply that a mu
 // deterministic checks + fallback are the safety net if it does.
 const EVALUATOR_MODEL="qwen/qwen3.5-9b";
 async function evaluateReply(userText,draftReply){try{const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply}],"evaluator",undefined,undefined,EVALUATOR_MODEL,"none");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){}return{pass:true,issue:null}}
+// Quick replies are their own small, cheap, JSON-mode call now — separated out
+// so the main call has nothing left to forget (no REPLY: *and* QUICK_REPLIES:
+// competing for its attention). Fired only when it's actually worth asking, and
+// never allowed to delay or reshape the main reply, which is already on screen
+// by the time this resolves.
+const QUICK_REPLY_MODEL="qwen/qwen3.5-9b";
+const QUICK_REPLY_SYSTEM="Given a supportive companion's reply and recent context, suggest up to 3 short quick-reply button options the user could tap to answer — a few words each, answers only, never questions. If nothing fits well, return an empty list. Respond ONLY JSON: {\"quick_replies\":[\"...\",\"...\"]}";
+// Chips are dropped if this call takes longer than the main reply has already
+// been on screen — a button popping in late reads as broken, not helpful.
+const QUICK_REPLY_STALE_MS=1000;
+// Consecutive turns quick replies were actually SHOWN (not just requested) —
+// reset to 0 whenever a turn ends without chips, for any reason.
+let quickReplyStreak=0;
+// #1: only worth asking if the reply actually posed a question. #2: not three
+// turns of chips in a row (streak already at 2 → this would-be 3rd is skipped).
+function shouldOfferQuickReplies(replyText){
+  if(!replyText.includes("?"))return false;
+  if(quickReplyStreak>=2)return false;
+  return true;
+}
+async function fetchQuickReplies(replyText){
+  const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
+  try{
+    const raw=await callGroq(QUICK_REPLY_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nCompanion's reply:\n"+replyText}],"quick_replies",undefined,undefined,QUICK_REPLY_MODEL,"none");
+    const parsed=safeParseJSON(raw);
+    if(parsed&&Array.isArray(parsed.quick_replies))return parsed.quick_replies.filter(qr=>qr&&qr.trim()).slice(0,3);
+  }catch(e){}
+  return [];
+}
+// Fire-and-forget: never awaited by the main flow, never blocks sendBtn from
+// re-enabling. `row` is the already-displayed reply bubble to attach chips to;
+// `myGeneration` guards against a late result landing after a newer message
+// has already started (so an old turn can't corrupt the current streak count
+// or attach stale chips to a bubble that's no longer the latest one).
+function maybeAttachQuickReplies(row,replyText,myGeneration){
+  if(!shouldOfferQuickReplies(replyText)){quickReplyStreak=0;return}
+  const _t0=performance.now();
+  fetchQuickReplies(replyText).then(list=>{
+    const elapsed=performance.now()-_t0;
+    if(myGeneration!==replyGeneration||elapsed>QUICK_REPLY_STALE_MS||!list.length){
+      console.log("[Sukoon] quick replies discarded — stale, superseded, or empty. elapsed:",Math.round(elapsed),"ms");
+      quickReplyStreak=0;
+      return;
+    }
+    quickReplyStreak=appendQuickReplies(row,list)?quickReplyStreak+1:0;
+  });
+}
 // Qwen 9B is small enough that only near-keyword-level checks are reliable —
 // medication_mention and out_of_scope are close to topic detection, so they
 // still block and retry immediately. Everything else needs real interpretive
@@ -312,17 +390,9 @@ function pickFallbackReply(){const pool=SAFE_FALLBACK_REPLIES.filter(r=>r!==last
 const EXTRACT_SYSTEM="Extract 1-3 short factual memory notes from this conversation that would help a supportive, non-clinical companion continue naturally in a future session. Each note under 12 words, factual. Do NOT include self-harm, suicide, or crisis content. Respond ONLY with compact JSON: {\"notes\":[\"...\",\"...\"]}";
 async function extractMemory(){if(!memoryEnabled)return;const recent=history.slice(-10);if(recent.length<2)return;try{const raw=await callGroq(EXTRACT_SYSTEM,recent,"memory");const parsed=safeParseJSON(raw);const notes=parsed&&Array.isArray(parsed.notes)?parsed.notes:null;if(notes&&notes.length){memoryFacts=notes.concat(memoryFacts).filter((v,i,a)=>a.indexOf(v)===i).slice(0,12);await saveMemory(memoryFacts)}}catch(e){}}
 function parseReplyPlain(raw){
-  const replyMatch=raw.match(/REPLY:\s*([\s\S]*?)(?:\n\s*QUICK_REPLIES:|$)/i);
-  const qrMatch=raw.match(/QUICK_REPLIES:\s*(.*)/i);
+  const replyMatch=raw.match(/REPLY:\s*([\s\S]*)/i);
   const reply=(replyMatch?replyMatch[1]:raw).trim();
-  let quick_replies=[];
-  if(qrMatch){
-    const qrText=qrMatch[1].trim();
-    if(qrText && !/^none$/i.test(qrText)){
-      quick_replies=qrText.split("|").map(s=>s.trim()).filter(Boolean);
-    }
-  }
-  return {hadReplyLabel:!!replyMatch,reply:reply||raw.trim(),quick_replies};
+  return {hadReplyLabel:!!replyMatch,reply:reply||raw.trim()};
 }
 // Keep safety/scope handling and local memory, but make the tested JSX prompt the
 // sole conversation policy used for main and retry replies.
@@ -333,7 +403,7 @@ function buildCanonicalSystemPrompt(contextNote){
     scopeDirective: contextNote
   });
 }
-async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;document.querySelector(".app").classList.add("compact");clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;
+async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;const myGeneration=++replyGeneration;document.querySelector(".app").classList.add("compact");clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;
 if(userTurnCount===1){const n=normalise(text);if(VENT_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="vent"}
 if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();
 // Standalone classify() call again — decides risk/scope BEFORE generation, so a
@@ -362,8 +432,8 @@ if(evalResult.pass){evalResult=await evaluateReply(text,parsed.reply);console.lo
 else console.log("[Sukoon] output had no REPLY: label — treating as a failure instead of showing raw text:",parsed.reply);
 if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
 else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
-if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=retryParsed.hadReplyLabel?await evaluateReply(text,retryParsed.reply):{pass:false,issue:"missing_reply_label"};if(!retryParsed.hadReplyLabel)console.log("[Sukoon] retry also had no REPLY: label — going straight to fallback, not raw text:",retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply(),quick_replies:[]};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply(),quick_replies:[]}}}
-removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});addBubble("assistant",parsed.reply,chip,parsed.quick_replies);if(!isFallback)codeCompanionTurn(text,parsed.reply)
+if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=retryParsed.hadReplyLabel?await evaluateReply(text,retryParsed.reply):{pass:false,issue:"missing_reply_label"};if(!retryParsed.hadReplyLabel)console.log("[Sukoon] retry also had no REPLY: label — going straight to fallback, not raw text:",retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply()};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply()}}}
+removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});const replyRow=addBubble("assistant",parsed.reply,chip,null);if(!isFallback){codeCompanionTurn(text,parsed.reply);maybeAttachQuickReplies(replyRow,parsed.reply,myGeneration)}else{quickReplyStreak=0}
 }catch(e){removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
