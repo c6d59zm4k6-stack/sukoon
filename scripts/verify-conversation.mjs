@@ -2,9 +2,9 @@ import { CANONICAL_SYSTEM_PROMPT, buildConversationPrompt } from "../conversatio
 import { TEST_SCENARIOS } from "../conversation/test-scenarios.js";
 
 const required = [
-  "1. THE CORE GOAL",
-  "21. DON'T REPEAT QUESTIONS",
-  "33. FINAL SELF-CHECK",
+  "1. RESPOND TO WHAT THEY SAID",
+  "17. NO MANUFACTURED METAPHORS",
+  "FINAL CHECK",
   "REPLY: <reply>",
   "QUICK_REPLIES: <option one> | <option two> | <option three>",
 ];
@@ -24,7 +24,12 @@ const runtimePrompt = buildConversationPrompt({
   scopeDirective: "Do not give medication advice.",
 });
 
-if (!runtimePrompt.includes("Work deadlines feel stressful.") || !runtimePrompt.includes("Do not give medication advice.")) {
+// buildConversationPrompt returns {static, dynamic}, not a string — checking
+// .includes() on the object itself was always a TypeError, never a real check.
+if (
+  !runtimePrompt.dynamic.includes("Work deadlines feel stressful.") ||
+  !runtimePrompt.dynamic.includes("Do not give medication advice.")
+) {
   throw new Error("Runtime memory or safety context was not included.");
 }
 
