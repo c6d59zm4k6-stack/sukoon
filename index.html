@@ -57,7 +57,6 @@
   .metric-block{margin-bottom:14px}.metric-block h4{margin:0 0 6px;font-size:.8rem;text-transform:uppercase;letter-spacing:.5px;color:var(--ink-soft);font-weight:600}.metric-row{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--mist);border-radius:8px;margin-bottom:4px;font-size:.82rem}.metric-row .val{font-variant-numeric:tabular-nums;font-weight:600}.status{font-size:.7rem;padding:2px 7px;border-radius:10px;margin-left:6px}.status.ok{background:var(--sage-soft);color:#3E5347}.status.off{background:var(--clay-soft);color:#7A3F2E}.status.na{background:var(--border);color:var(--ink-soft)}.metric-note{font-size:.72rem;color:var(--ink-soft);margin:6px 0 0;line-height:1.4}.btn{flex:1;border:none;border-radius:12px;padding:10px;font-size:.85rem;cursor:pointer;font-family:'Inter',sans-serif;font-weight:500}.btn-ghost{background:var(--mist);color:var(--ink)}.btn-danger{background:var(--clay-soft);color:#7A3F2E}.btn-primary{background:var(--marigold);color:var(--indigo-deep)}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
   #model-select{width:100%;background:#fff;border:1px solid var(--border);color:var(--ink);font-size:16px;font-family:'Inter',sans-serif;padding:9px 10px;border-radius:10px;cursor:pointer}
   #model-select option{color:var(--ink);background:#fff}
-  .bubble.filler{opacity:.6;font-style:italic}
   .more-wrap{position:relative}
   .icon-btn.icon-only{width:40px;height:40px;padding:0;border-radius:50%;justify-content:center}
   .more-panel{position:absolute;top:calc(100% + 8px);right:0;background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(64,56,46,.22);padding:10px;min-width:200px;max-width:calc(100vw - 32px);display:none;z-index:30}
@@ -176,9 +175,9 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,ov
   if(!data.text){
     if(!_isRetryAttempt){
       // Almost always reasoning tokens eating the whole budget before any visible
-      // text gets written (same shape we already found and fixed for DeepSeek and
-      // the filler call) — worth one automatic retry before treating it as a real
-      // failure, same tier as the 429/400 handling above.
+      // text gets written (same shape we found and fixed for DeepSeek) — worth
+      // one automatic retry before treating it as a real failure, same tier as
+      // the 429/400 handling above.
       console.warn("[Sukoon]",stage,"returned empty text, retrying once");
       return callGroq(systemPrompt,messages,stage,maxTokens,true,overrideModel,overrideReasoning);
     }
@@ -253,28 +252,51 @@ function addCrisisCard(){const row=document.createElement("div");row.className="
 function addTyping(){const row=document.createElement("div");row.className="bubble-row companion";row.id="typing-row";row.innerHTML="<div class='bubble typing'><span></span><span></span><span></span></div>";chatEl.appendChild(row);scrollToBottom()}function removeTyping(){const row=document.getElementById("typing-row");if(row)row.remove()}
 const CLASSIFY_SYSTEM="You are a safety and scope classifier for a supportive, non-clinical AI companion chat. Given the latest user message and brief recent context, output ONLY compact JSON: {\"risk\":\"none\"|\"crisis\"|\"elevated_distress\",\"scope\":\"in_scope\"|\"medical_advice_seeking\"|\"diagnosis_seeking\"|\"unrelated_task\"|\"confused_by_question\"}. crisis = explicit or strongly implied suicidal ideation, self-harm intent, or immediate danger. elevated_distress = significant distress or hopelessness without explicit crisis. medical_advice_seeking = medication/dose/treatment. diagnosis_seeking = asking for a condition/diagnosis. unrelated_task = coding, homework, trivia, etc. confused_by_question = the person says they don't understand, are confused by, or are pushing back on the companion's own last question or reflection (e.g. 'I don't understand what you mean', 'what does that even mean', 'that question doesn't make sense', 'huh?'). Do not use this for general life confusion unrelated to the companion's last message. in_scope = normal supportive conversation.";
 async function classify(latestUserText){const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");try{const raw=await callGroq(CLASSIFY_SYSTEM,[{role:"user",content:"Latest user message:\n"+latestUserText+"\n\nRecent context:\n"+recentContext}],"classifier");const parsed=safeParseJSON(raw);if(parsed&&parsed.risk&&parsed.scope)return parsed}catch(e){}return{risk:"none",scope:"in_scope"}}
-const EVALUATOR_SYSTEM="You are a strict output evaluator for a supportive, non-clinical AI companion reply. Judge: no unsolicited advice unless explicitly asked; no diagnosis/clinical language; no medication/treatment recommendations; warm and validating; no unrelated tasks; no parasocial claims; no unearned complex reflection; no fabricated detail. fabricated_detail = the reply references a specific activity, object, event, or detail that the person did not actually say, even loosely — check the recent conversation provided, not just the last message. Respond ONLY JSON: {\"pass\":true|false,\"issue\":null|\"unsolicited_advice\"|\"diagnosis_language\"|\"medication_mention\"|\"low_empathy\"|\"out_of_scope\"|\"parasocial_overclaim\"|\"unearned_complex_reflection\"|\"fabricated_detail\"}";
+// Turns classify()'s scope/risk verdict into the one-turn instruction the main
+// prompt used to give itself when it was self-checking. Built in JS now, not
+// baked into the static (cached) prompt, since it only applies some turns.
+const SCOPE_NOTES={
+  medical_advice_seeking:"SCOPE: medical_advice_seeking — explain briefly this is outside this chat and steer back to how they are feeling.",
+  diagnosis_seeking:"SCOPE: diagnosis_seeking — do not name or suggest a diagnosis; explain this is outside this chat and steer back to their experience.",
+  unrelated_task:"SCOPE: unrelated_task — decline briefly and steer back to how they are doing.",
+  confused_by_question:"SCOPE: confused_by_question — do not ask another abstract or meta question about their confusion. Either drop the question and reflect back something concrete and simple in their own words, or ask one very plain, concrete question tied to something specific they already told you."
+};
+function scopeDirectiveFor(cls){
+  if(cls.scope==="confused_by_question"&&consecutiveConfusionTurns>=1){
+    return "SCOPE: confused_by_question (already happened once) — do not reflect the confusion again; instead pick one concrete thing they already told you and turn it into a single simple, closed, easy-to-answer next step.";
+  }
+  if(SCOPE_NOTES[cls.scope])return SCOPE_NOTES[cls.scope];
+  if(cls.risk==="elevated_distress")return "RISK: elevated_distress — prioritize warmth and validation; don't suggest an activity.";
+  return "";
+}
+const EVALUATOR_RULES="Judge: no unsolicited advice unless explicitly asked; no diagnosis/clinical language; no medication/treatment recommendations; warm and validating; no unrelated tasks; no parasocial claims; no unearned complex reflection; no fabricated detail. fabricated_detail = the reply references a specific activity, object, event, or detail that the person did not actually say, even loosely — check the recent conversation provided, not just the last message. Respond ONLY JSON: {\"pass\":true|false,\"issue\":null|\"unsolicited_advice\"|\"diagnosis_language\"|\"medication_mention\"|\"low_empathy\"|\"out_of_scope\"|\"parasocial_overclaim\"|\"unearned_complex_reflection\"|\"fabricated_detail\"}";
+const EVALUATOR_SYSTEM="You are a strict output evaluator for a supportive, non-clinical AI companion reply. "+EVALUATOR_RULES;
+// Used only for the second-opinion audit call. Qwen 9B is small and over-flags
+// on anything needing real judgment — this call is deliberately told that its
+// own flag is a hint to look closely, not a verdict to rubber-stamp, since the
+// model running this audit is more capable than the one that raised the flag.
+const AUDIT_SYSTEM="You are the second, more careful review of a reply that a much smaller model (Qwen 9B) already flagged as a possible issue. Qwen 9B can only reliably catch obvious problems — on anything requiring real judgment (is this actually advice vs. a validating reflection with a question, is the empathy actually low, is a reflection actually unearned, is a detail actually fabricated, does this actually name a diagnosis, is this actually an overclaimed relationship) it produces a lot of false flags. You are more capable than it — do not treat its flag as ground truth. Judge the reply fresh, independently, using your own better judgment, and only agree with the flag if you would genuinely raise it yourself, looking at the reply cold. "+EVALUATOR_RULES;
 // Independent of the dropdown — the evaluator is a fixed, cheap check regardless
 // of which model is generating the reply. Known risk, accepted deliberately: a
 // small model may pass things a stronger one would catch. The existing retry +
 // deterministic checks + fallback are the safety net if it does.
 const EVALUATOR_MODEL="qwen/qwen3.5-9b";
 async function evaluateReply(userText,draftReply){try{const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply}],"evaluator",undefined,undefined,EVALUATOR_MODEL,"none");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){}return{pass:true,issue:null}}
-// Not every issue type deserves the same trust from a cheap evaluator. OBVIOUS
-// ones are closer to keyword/topic detection — a small model should catch these
-// reliably, so they still block and retry immediately. COMPLEX ones require real
-// interpretive judgment (is this actually advice, or a validating reflection with
-// a question?) — exactly where the cheap model has now shown it over-flags. For
-// those, don't block this turn; let the reply through, and queue a follow-up
-// check with the full-cost model so a real issue doesn't just repeat unnoticed.
-const COMPLEX_EVALUATOR_ISSUES=new Set(["unsolicited_advice","low_empathy","unearned_complex_reflection"]);
+// Qwen 9B is small enough that only near-keyword-level checks are reliable —
+// medication_mention and out_of_scope are close to topic detection, so they
+// still block and retry immediately. Everything else needs real interpretive
+// judgment (is this actually a diagnosis-adjacent claim, a fabricated detail,
+// an overclaimed relationship, unsolicited advice, low empathy, an unearned
+// reflection?) — exactly where a 9B model is unreliable. Those get deferred:
+// let the reply through, queue a follow-up check with the higher-cost model.
+const COMPLEX_EVALUATOR_ISSUES=new Set(["unsolicited_advice","low_empathy","unearned_complex_reflection","diagnosis_language","parasocial_overclaim","fabricated_detail"]);
 let pendingSteeringNote="";
 async function auditComplexFlag(userText,replyText,issue){
   try{
     const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
     // No model override here — deliberately uses whatever's selected (the
     // higher-cost model), since this is the second opinion, not the fast pass.
-    const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+replyText}],"evaluator_audit");
+    const raw=await callGroq(AUDIT_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+replyText+"\n\nQwen 9B flagged this reply for: "+issue}],"evaluator_audit");
     const parsed=safeParseJSON(raw);
     if(parsed&&parsed.pass===false&&parsed.issue===issue){
       pendingSteeringNote="Your previous reply was flagged for "+issue+" on a closer look — this turn, deliberately avoid repeating that pattern.";
@@ -289,80 +311,6 @@ let lastFallbackText=null;
 function pickFallbackReply(){const pool=SAFE_FALLBACK_REPLIES.filter(r=>r!==lastFallbackText);const choice=pool[Math.floor(Math.random()*pool.length)];lastFallbackText=choice;return choice}
 const EXTRACT_SYSTEM="Extract 1-3 short factual memory notes from this conversation that would help a supportive, non-clinical companion continue naturally in a future session. Each note under 12 words, factual. Do NOT include self-harm, suicide, or crisis content. Respond ONLY with compact JSON: {\"notes\":[\"...\",\"...\"]}";
 async function extractMemory(){if(!memoryEnabled)return;const recent=history.slice(-10);if(recent.length<2)return;try{const raw=await callGroq(EXTRACT_SYSTEM,recent,"memory");const parsed=safeParseJSON(raw);const notes=parsed&&Array.isArray(parsed.notes)?parsed.notes:null;if(notes&&notes.length){memoryFacts=notes.concat(memoryFacts).filter((v,i,a)=>a.indexOf(v)===i).slice(0,12);await saveMemory(memoryFacts)}}catch(e){}}
-function parseCombinedReply(raw){
-  const riskMatch=raw.match(/RISK:\s*(none|elevated_distress|crisis)/i);
-  const scopeMatch=raw.match(/SCOPE:\s*(in_scope|medical_advice_seeking|diagnosis_seeking|unrelated_task|confused_by_question)/i);
-  const replyMatch=raw.match(/REPLY:\s*([\s\S]*?)(?:\n\s*QUICK_REPLIES:|$)/i);
-  const qrMatch=raw.match(/QUICK_REPLIES:\s*(.*)/i);
-  const reply=(replyMatch?replyMatch[1]:raw).trim();
-  let quick_replies=[];
-  if(qrMatch){
-    const qrText=qrMatch[1].trim();
-    if(qrText && !/^none$/i.test(qrText)){
-      quick_replies=qrText.split("|").map(s=>s.trim()).filter(Boolean);
-    }
-  }
-  // Defaults to the safe/normal case if parsing fails for any reason — same
-  // fail-open direction the old standalone classify() used on error. hadReplyLabel
-  // is exposed separately so the caller can treat a missing label as a real
-  // failure (retry) rather than silently showing whatever raw text came back —
-  // this is exactly what let a bare "RISK: none" leak into the chat once.
-  return {
-    risk: riskMatch ? riskMatch[1].toLowerCase() : "none",
-    scope: scopeMatch ? scopeMatch[1].toLowerCase() : "in_scope",
-    hadReplyLabel: !!replyMatch,
-    reply: reply || raw.trim(),
-    quick_replies
-  };
-}
-// Short, throwaway asides shown while waiting — never sent to the model as real
-// conversation, never counted as part of history. Purely a UI nicety.
-const FILLER_REPLIES=["hmm.","mm.","yeah...","right...","mm, okay.","yeah, go on."];
-// Tier 2: a genuine small/cheap model, only attempted if the real reply is still
-// not back after a while. Races against its own short cutoff so it can never
-// delay anything — if it's not back in time, or fails, or fails the safety gate,
-// we just fall back to a generic tier-1-style phrase instead.
-const FILLER_MODEL="qwen/qwen3.5-9b";
-const FILLER_SYSTEM="You are generating a tiny 1-3 word spoken reaction — like \"ugh.\", \"oh no.\", \"wow.\", \"oof.\", \"geez.\" — to what the person just said, while a fuller reply is still being written. This is NOT the actual reply. Do NOT assess, judge, or comment on their situation — never things like \"that sounds hard\" or \"that's stressful\" — the real reply is about to say something like that already, so a similar filler just repeats it right before. Just a short exclamation or sound, 1-3 words only, no question marks, no claims. Output only that, nothing else.";
-const FILLER_LLM_TIMEOUT_MS=900;
-const FILLER_TIER2_DELAY_MS=2000;
-function isSafeFillerText(text){
-  if(!text)return false;
-  const t=text.trim();
-  if(!t||t.length>30)return false;
-  const words=t.split(/\s+/).filter(Boolean);
-  if(!words.length||words.length>3)return false;
-  if(t.includes("?"))return false;
-  return true;
-}
-async function fetchContextualFiller(userText){
-  const _t0=performance.now();
-  const controller=new AbortController();
-  const timeoutId=setTimeout(()=>controller.abort(),FILLER_LLM_TIMEOUT_MS);
-  try{
-    const response=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:FILLER_SYSTEM,messages:[{role:"user",content:userText}],model:FILLER_MODEL,max_tokens:20,plain_text:true,reasoning_effort:"none"}),signal:controller.signal});
-    clearTimeout(timeoutId);
-    const data=await response.json();
-    console.log("[Sukoon] TIMING filler-llm took",Math.round(performance.now()-_t0),"ms","— result:",data&&data.text);
-    if(!response.ok||!data.text)return null;
-    const text=data.text.trim();
-    return isSafeFillerText(text)?text:null;
-  }catch(e){
-    clearTimeout(timeoutId);
-    console.log("[Sukoon] TIMING filler-llm aborted/failed after",Math.round(performance.now()-_t0),"ms");
-    return null;
-  }
-}
-function addFillerBubble(text){
-  const row=document.createElement("div");
-  row.className="bubble-row companion";
-  const bubble=document.createElement("div");
-  bubble.className="bubble filler";
-  bubble.textContent=text;
-  row.appendChild(bubble);
-  chatEl.appendChild(row);
-  scrollToBottom();
-}
 function parseReplyPlain(raw){
   const replyMatch=raw.match(/REPLY:\s*([\s\S]*?)(?:\n\s*QUICK_REPLIES:|$)/i);
   const qrMatch=raw.match(/QUICK_REPLIES:\s*(.*)/i);
@@ -388,39 +336,27 @@ function buildCanonicalSystemPrompt(contextNote){
 async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;document.querySelector(".app").classList.add("compact");clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;
 if(userTurnCount===1){const n=normalise(text);if(VENT_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="vent"}
 if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();
-// Occasionally shows a quick "hmm." / "yeah..." aside if the reply takes a moment —
-// not every turn (45% chance), and only if it's still waiting 1.3s in. Cancelled the
-// instant a real response comes back, so it never trails behind or shows up stale.
-let shownFillerWord=null;
-let fillerTimer=setTimeout(()=>{if(Math.random()<0.45){shownFillerWord=FILLER_REPLIES[Math.floor(Math.random()*FILLER_REPLIES.length)];addFillerBubble(shownFillerWord)}},1300);
-let replyLanded=false;
-let fillerTimer2=setTimeout(async()=>{
-  if(replyLanded)return;
-  const contextual=await fetchContextualFiller(text);
-  if(replyLanded)return; // real reply may have landed while that call was in flight
-  let fallbackPool=FILLER_REPLIES.filter(w=>w!==shownFillerWord);
-  if(!fallbackPool.length)fallbackPool=FILLER_REPLIES;
-  addFillerBubble(contextual||fallbackPool[Math.floor(Math.random()*fallbackPool.length)]);
-},FILLER_TIER2_DELAY_MS);
-// Was: a separate classify() call before main, gating what main was told to do.
-// Now: main does its own risk/scope self-check as part of one combined call (see
-// prompt.js SELF-CHECK section) — cuts a full sequential round trip off every turn.
-// contextNote only carries prior-turn state the model can't infer on its own.
+// Standalone classify() call again — decides risk/scope BEFORE generation, so a
+// crisis message never spends a generation call at all, and main is never asked
+// to judge its own risk/scope (that self-check was dropped from the prompt).
+// Skipped for quick-reply chip taps — those options are pre-vetted, model-chosen
+// text, not free-form input, so there's nothing new to classify.
+const cls=opts.skipClassify?{risk:"none",scope:"in_scope"}:await classify(text);
+if(cls.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
 let ventCheckNote="";
 if(initialIntent==="vent"&&!ventCheckInDone&&userTurnCount>=VENT_CHECKIN_AT_TURN){
   ventCheckNote="They said early on they just wanted to vent — that's been the assumed goal. It's been a few turns now: this turn, naturally check in, genuinely open to either answer — are they looking to keep talking it through, or is there something they're trying to figure out or do about it? Don't push toward solutions, just ask.";
   ventCheckInDone=true;
 }
 const contextNote=[
-  consecutiveConfusionTurns>=1?("CONTEXT: they have signaled confusion about your last message "+consecutiveConfusionTurns+" time(s) in a row so far."):"",
+  scopeDirectiveFor(cls),
   pendingSteeringNote,
   ventCheckNote
 ].filter(Boolean).join(" ");
+if(cls.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
-try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseCombinedReply(raw);console.log("[Sukoon] parsed reply:",parsed);replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);
-if(parsed.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
-if(parsed.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
-lastCandidateActivity=(parsed.risk!=="elevated_distress"&&parsed.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
+try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseReplyPlain(raw);console.log("[Sukoon] parsed reply:",parsed);
+lastCandidateActivity=(cls.risk!=="elevated_distress"&&cls.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
 let evalResult=parsed.hadReplyLabel?{pass:true,issue:null}:{pass:false,issue:"missing_reply_label"};
 if(evalResult.pass){evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);}
 else console.log("[Sukoon] output had no REPLY: label — treating as a failure instead of showing raw text:",parsed.reply);
@@ -428,7 +364,7 @@ if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);i
 else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
 if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=retryParsed.hadReplyLabel?await evaluateReply(text,retryParsed.reply):{pass:false,issue:"missing_reply_label"};if(!retryParsed.hadReplyLabel)console.log("[Sukoon] retry also had no REPLY: label — going straight to fallback, not raw text:",retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply(),quick_replies:[]};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply(),quick_replies:[]}}}
 removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});addBubble("assistant",parsed.reply,chip,parsed.quick_replies);if(!isFallback)codeCompanionTurn(text,parsed.reply)
-}catch(e){replyLanded=true;clearTimeout(fillerTimer);clearTimeout(fillerTimer2);removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
+}catch(e){removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
 moreBtn.addEventListener("click",e=>{e.stopPropagation();const isOpen=morePanel.classList.toggle("open");moreBtn.setAttribute("aria-expanded",isOpen?"true":"false")});
