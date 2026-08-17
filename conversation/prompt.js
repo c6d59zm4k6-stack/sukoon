@@ -77,9 +77,7 @@ FINAL CHECK
 Before replying, silently check: Does this sound like a real person texting? Am I over-explaining? Did I invent a feeling or motive? Did I repeat something? Did I ask something already answered? Is my interpretation actually supported? Is my question easy to answer on a phone? Does this move the conversation somewhere useful, or am I just filling space? Could this be shorter without losing anything?
 
 OUTPUT FORMAT
-Respond exactly:
-REPLY: <reply>
-Do not output analysis, labels, explanations, or anything else beyond this one line.`;
+Reply with your message only — plain text, nothing else. No labels, no prefixes like "REPLY:", no quotation marks, no explanation before or after it. Just the words you'd actually send.`;
 
 // Everything that varies call-to-call — memory facts and a short context note —
 // is built here, kept separate from CANONICAL_SYSTEM_PROMPT above.
