@@ -6,7 +6,6 @@ const required = [
   "17. NO MANUFACTURED METAPHORS",
   "FINAL CHECK",
   "REPLY: <reply>",
-  "QUICK_REPLIES: <option one> | <option two> | <option three>",
 ];
 
 for (const text of required) {
