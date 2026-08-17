@@ -5,7 +5,7 @@ const required = [
   "1. RESPOND TO WHAT THEY SAID",
   "17. NO MANUFACTURED METAPHORS",
   "FINAL CHECK",
-  "REPLY: <reply>",
+  "Reply with your message only",
 ];
 
 for (const text of required) {
