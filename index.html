@@ -186,7 +186,7 @@ async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,ov
   console.log("[Sukoon] TIMING",stage,"("+modelToUse+")","took",Math.round(performance.now()-_t0),"ms");
   return data.text;
 }
-const MAX_REPLY_WORDS=70,MAX_READING_GRADE=5.4,MIN_WORDS_FOR_READING_CHECK=8;
+const MAX_REPLY_WORDS=70,MAX_READING_GRADE=10,MIN_WORDS_FOR_READING_CHECK=8;
 function wordCount(text){return text.trim().split(/\s+/).filter(Boolean).length}
 function countSyllables(word){word=word.toLowerCase().replace(/[^a-z]/g,"");if(!word)return 0;if(word.length<=3)return 1;word=word.replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/,"");word=word.replace(/^y/,"");const matches=word.match(/[aeiouy]{1,2}/g);return matches?matches.length:1}
 function fleschKincaidGrade(text){const sentences=text.split(/[.!?]+/).map(s=>s.trim()).filter(Boolean),words=text.split(/\s+/).map(w=>w.replace(/[^a-zA-Z']/g,"")).filter(Boolean);if(!words.length)return 0;const sc=Math.max(sentences.length,1),wc=words.length;let syllables=0;words.forEach(w=>syllables+=countSyllables(w));return .39*(wc/sc)+11.8*(syllables/wc)-15.59}
