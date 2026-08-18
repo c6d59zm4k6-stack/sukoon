@@ -389,7 +389,7 @@ async function classifyReadiness(latestUserText){
   const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
   const userContent="Previous readiness: "+(readinessStage||"(none)")+"\n\n"+recentContext+"\nuser: "+latestUserText;
   try{
-    const raw=await callGroqDirect(READINESS_SYSTEM,userContent,READINESS_MODEL,null,200,"readiness");
+    const raw=await callGroqDirect(READINESS_SYSTEM,userContent,READINESS_MODEL,null,1000,"readiness");
     const parsed=safeParseJSON(raw);
     if(parsed&&parsed.readiness)return parsed.readiness;
   }catch(e){console.error("[Sukoon] readiness classifier failed:",e)}
