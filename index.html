@@ -572,6 +572,8 @@ if(initialIntent==="vent"&&!ventCheckInDone&&userTurnCount>=VENT_CHECKIN_AT_TURN
 }
 const stateNote=buildStateNote(focusResult);
 const readinessNote=wantsReadiness?readinessNoteFor(readinessStage):"";
+console.log("[Sukoon] focus result:",focusResult,"| goalMode:",goalMode,"| stateNote:",stateNote||"(empty)");
+console.log("[Sukoon] readiness result:",readinessResult,"| wantsReadiness:",wantsReadiness,"| readinessNote:",readinessNote||"(empty)");
 const contextNote=[
   scopeDirectiveFor(cls),
   pendingSteeringNote,
