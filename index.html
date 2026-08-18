@@ -230,7 +230,7 @@ let history=[],memoryFacts=[],memoryEnabled=true,usedActivityIds=new Set(),lastC
 // null -> "pending" (question asked) -> "wants_change" | "validation_only".
 // Known simplification: once resolved, goalMode is not currently re-opened by
 // later unprompted change-talk — that re-trigger case is deferred, not built.
-let conversationFocus="",focusStableTurns=0,goalMode=null,readinessStage=null;
+let conversationFocus="",focusStableTurns=0,goalMode=null,readinessStage=null,depthPushed=false;
 // Bumped at the start of every sendMessage() — lets the async quick-reply
 // fetch tell whether it's still answering the latest turn by the time it
 // resolves, or a newer message has already started (see maybeAttachQuickReplies).
@@ -403,7 +403,7 @@ function buildStateNote(focusResult){
     notes.push("FOCUS just changed to: "+focusResult.core_focus+". Check in on this, in your own words, before moving on to anything else — this takes priority over whatever you were about to ask next.");
   }
   conversationFocus=focusResult.core_focus||conversationFocus;
-  if(focusResult.focus_changed)focusStableTurns=0;else focusStableTurns++;
+  if(focusResult.focus_changed){focusStableTurns=0;depthPushed=false}else focusStableTurns++;
   if(goalMode==="pending"){
     // Last turn we asked "work on it, or just wanted to get it out?" — this
     // turn's message is their answer, read via the same wants_change field
@@ -416,6 +416,15 @@ function buildStateNote(focusResult){
   }else if(goalMode===null&&focusStableTurns>=2&&focusResult.stage==="moving"){
     notes.push("The focus has settled on: "+conversationFocus+". Naturally ask, once, plainly: is this something they'd want to work on, or did they mostly just want to get it out? Don't push toward either answer.");
     goalMode="pending";
+  }else if(goalMode==="wants_change"&&!depthPushed&&focusStableTurns>=3){
+    // The gap this plugs: once the goal is locked in, the only note left in
+    // rotation was readinessNoteFor's brake ("don't jump to suggestions") —
+    // nothing ever pushed the other direction. Without this, the model just
+    // keeps gathering surface detail forever, since nothing tells it it's
+    // gathered enough. Fires once per focus, not every turn, so it's a nudge
+    // and not a nag if the model doesn't shift right away.
+    notes.push("You have a clear, concrete picture of what's going on now. Shift from gathering more detail to exploring what this is like for them — how they feel about it, what it's costing them, or what pulls them two ways about it. Don't ask another fact-gathering question this turn.");
+    depthPushed=true;
   }
   return notes.join(" ");
 }
