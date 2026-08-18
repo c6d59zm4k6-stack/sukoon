@@ -26,9 +26,13 @@ export default async function handler(req, res) {
         { role: "system", content: system },
         { role: "user", content: user }
       ],
-      // These are short JSON verdicts, not conversation replies — keep the
-      // budget tight and temperature low so output stays consistent.
-      max_tokens: Math.min(Number(max_tokens) || 150, 400),
+      // These are short JSON verdicts, not conversation replies, but the
+      // focus classifier runs with reasoning_effort set — reasoning tokens
+      // eat into this same budget on Groq, so it needs real headroom or the
+      // JSON gets truncated mid-object and fails validation (seen live: a
+      // 150-token cap was cutting off the focus call specifically). Cap
+      // raised accordingly; callers pass their own max_tokens per call.
+      max_tokens: Math.min(Number(max_tokens) || 150, 1200),
       temperature: 0.2,
       response_format: { type: "json_object" }
     };
@@ -54,8 +58,14 @@ export default async function handler(req, res) {
     const data = await groqResponse.json();
     if (!groqResponse.ok) {
       console.error("Groq API error:", data);
+      // Groq's JSON-mode validation failures include a failed_generation
+      // field with the model's actual raw output — surface it to the client
+      // instead of dropping it, since that's the difference between "the
+      // model returned truncated JSON" and "the model wrote a paragraph
+      // instead of JSON," which need different fixes.
       return res.status(groqResponse.status).json({
-        error: data?.error?.message || "Groq request failed."
+        error: data?.error?.message || "Groq request failed.",
+        failedGeneration: data?.error?.failed_generation || null
       });
     }
     if (data?.usage) console.log("[Sukoon] groq usage:", model, data.usage);
