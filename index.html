@@ -225,6 +225,12 @@ async function loadAggregate(){try{const v=localStorage.getItem("sukoon_mi_aggre
 async function persistAggregate(codes){codes.forEach(c=>{if(c in aggregateTally)aggregateTally[c]++});aggregateTally.turns++;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:aggregateSessions}))}catch(e){}}
 async function resetAggregate(){aggregateTally=emptyTally();aggregateSessions=0;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:0}))}catch(e){}renderDebugPanel()}
 let history=[],memoryFacts=[],memoryEnabled=true,usedActivityIds=new Set(),lastCandidateActivity=null,userTurnCount=0,askedQuestions=[],consecutiveConfusionTurns=0;
+// State for the two conversation-state classifiers (focus and readiness) — see
+// classifyFocus()/classifyReadiness()/buildStateNote() below. goalMode moves
+// null -> "pending" (question asked) -> "wants_change" | "validation_only".
+// Known simplification: once resolved, goalMode is not currently re-opened by
+// later unprompted change-talk — that re-trigger case is deferred, not built.
+let conversationFocus="",focusStableTurns=0,goalMode=null,readinessStage=null;
 // Bumped at the start of every sendMessage() — lets the async quick-reply
 // fetch tell whether it's still answering the latest turn by the time it
 // resolves, or a newer message has already started (see maybeAttachQuickReplies).
@@ -295,6 +301,127 @@ function addCrisisCard(){const row=document.createElement("div");row.className="
 function addTyping(){const row=document.createElement("div");row.className="bubble-row companion";row.id="typing-row";row.innerHTML="<div class='bubble typing'><span></span><span></span><span></span></div>";chatEl.appendChild(row);scrollToBottom()}function removeTyping(){const row=document.getElementById("typing-row");if(row)row.remove()}
 const CLASSIFY_SYSTEM="You are a safety and scope classifier for a supportive, non-clinical AI companion chat. Given the latest user message and brief recent context, output ONLY compact JSON: {\"risk\":\"none\"|\"crisis\"|\"elevated_distress\",\"scope\":\"in_scope\"|\"medical_advice_seeking\"|\"diagnosis_seeking\"|\"unrelated_task\"|\"confused_by_question\"}. crisis = explicit or strongly implied suicidal ideation, self-harm intent, or immediate danger. elevated_distress = significant distress or hopelessness without explicit crisis. medical_advice_seeking = medication/dose/treatment. diagnosis_seeking = asking for a condition/diagnosis. unrelated_task = coding, homework, trivia, etc. confused_by_question = the person says they don't understand, are confused by, or are pushing back on the companion's own last question or reflection (e.g. 'I don't understand what you mean', 'what does that even mean', 'that question doesn't make sense', 'huh?'). Do not use this for general life confusion unrelated to the companion's last message. in_scope = normal supportive conversation.";
 async function classify(latestUserText){const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");try{const raw=await callGroq(CLASSIFY_SYSTEM,[{role:"user",content:"Latest user message:\n"+latestUserText+"\n\nRecent context:\n"+recentContext}],"classifier");const parsed=safeParseJSON(raw);if(parsed&&parsed.risk&&parsed.scope)return parsed}catch(e){}return{risk:"none",scope:"in_scope"}}
+// ---- Conversation-state classifiers (native Groq, bypasses OpenRouter) ----
+// Run every turn in parallel with classify() above. Track what the conversation
+// is actually about and how ready the person seems to work on it — separate
+// from the risk/scope check, which only knows if a message is safe/in-scope,
+// not what it means. Feed one short note into the main prompt's existing
+// scopeDirective slot; the main model never sees these classifiers or their
+// state directly, same as memory/scope today.
+// Model IDs confirmed against the Groq console.
+const FOCUS_MODEL="openai/gpt-oss-120b";
+const READINESS_MODEL="qwen/qwen3.6-27b";
+const FOCUS_SYSTEM=`Task: read a short supportive chat. Decide what matters most right now, and whether it just changed.
+
+Output ONLY this JSON, nothing else:
+{"stage":"understanding"|"moving","core_focus":"<5-8 words>","focus_changed":true|false,"wants_change":true|false}
+
+stage: "understanding" = still gathering facts or background, no feeling/reason explored yet. "moving" = a feeling, reason, or next step tied to the core focus is being explored.
+
+core_focus: the ONE thing driving how the person feels or what they want right now - not the topic, the specific thing underneath it. Their own words if possible. Keep it short.
+
+focus_changed: true ONLY if the newest message reveals something MORE central than before - not just another fact about the same thing. False if just more detail, or if this is the first message.
+
+wants_change: true ONLY if they directly and unmistakably said they want to change, fix, stop, or improve the core_focus itself ("I want to stop doing this"). False if only describing or reacting to it, even with frustration.
+
+You get the previous focus you reported last turn. Keep it unless the new message clearly points somewhere more central.
+
+Example A:
+Previous focus: (none)
+user: my manager criticized my report in front of the team
+assistant: what happened after that?
+user: I just said okay and left. but I keep replaying it
+assistant: what part keeps coming back?
+user: that I didn't say anything back. I never do
+Output: {"stage":"moving","core_focus":"never speaking up when criticized","focus_changed":true,"wants_change":false}
+
+Example B:
+Previous focus: (none)
+user: I procrastinate a lot and I want to stop
+Output: {"stage":"understanding","core_focus":"wants to stop procrastinating","focus_changed":true,"wants_change":true}
+
+Only output the JSON object. No explanation, no markdown.`;
+const READINESS_SYSTEM=`Task: the person has already said they want to work on or change something. Read a short chat and decide how ready they seem to actually do it, right now.
+
+Output ONLY this JSON, nothing else:
+{"readiness":"precontemplation"|"contemplation"|"preparation"|"action"|"maintenance"}
+
+precontemplation = does not really see it as a problem, or resists the idea of changing it
+contemplation = sees it as an issue, is thinking about it, but has no real plan ("I guess I would like to...")
+preparation = wants to try something soon, open to a small concrete step
+action = actively trying something right now
+maintenance = already changed it, working on keeping it up
+
+Rules:
+- You will get the readiness you reported last turn. Keep that same stage unless the newest message clearly moves it.
+- Only move backward a stage if the person clearly pushed back, gave up, or sounded discouraged in their newest message.
+- If unsure or there is too little evidence, keep the same stage as before.
+
+Example:
+Previous readiness: contemplation
+user: I want to stop procrastinating on reports
+assistant: what does it usually look like when you start avoiding one?
+user: I open my laptop then just browse instead. I know it's dumb
+assistant: what do you think is happening in that moment?
+user: honestly I don't know. maybe I'd try setting a timer if you have ideas
+Output: {"readiness":"preparation"}
+
+Output only the JSON object. No explanation, no markdown.`;
+async function callGroqDirect(system,user,model,reasoningEffort){
+  const response=await fetch("/api/groq-classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system,user,model,max_tokens:150,reasoning_effort:reasoningEffort})});
+  const data=await response.json();
+  if(!response.ok)throw new Error(data?.error||"groq classify failed");
+  return data.text||"";
+}
+async function classifyFocus(latestUserText){
+  const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
+  const userContent="Previous focus: "+(conversationFocus||"(none)")+"\n\n"+recentContext+"\nuser: "+latestUserText;
+  try{
+    const raw=await callGroqDirect(FOCUS_SYSTEM,userContent,FOCUS_MODEL,"low");
+    const parsed=safeParseJSON(raw);
+    if(parsed&&typeof parsed.core_focus==="string")return parsed;
+  }catch(e){console.error("[Sukoon] focus classifier failed:",e)}
+  return{stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false};
+}
+async function classifyReadiness(latestUserText){
+  const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
+  const userContent="Previous readiness: "+(readinessStage||"(none)")+"\n\n"+recentContext+"\nuser: "+latestUserText;
+  try{
+    const raw=await callGroqDirect(READINESS_SYSTEM,userContent,READINESS_MODEL,null);
+    const parsed=safeParseJSON(raw);
+    if(parsed&&parsed.readiness)return parsed.readiness;
+  }catch(e){console.error("[Sukoon] readiness classifier failed:",e)}
+  return readinessStage||"contemplation";
+}
+// Plain code, not AI — decides what (if anything) the main model needs to
+// hear based on the focus classifier's latest read, and advances goalMode.
+function buildStateNote(focusResult){
+  const notes=[];
+  if(focusResult.focus_changed&&conversationFocus){
+    notes.push("FOCUS just changed to: "+focusResult.core_focus+". Check in on this, in your own words, before moving on to anything else — this takes priority over whatever you were about to ask next.");
+  }
+  conversationFocus=focusResult.core_focus||conversationFocus;
+  if(focusResult.focus_changed)focusStableTurns=0;else focusStableTurns++;
+  if(goalMode==="pending"){
+    // Last turn we asked "work on it, or just wanted to get it out?" — this
+    // turn's message is their answer, read via the same wants_change field
+    // (the classifier sees our question in recent context, so a short
+    // "yeah"/"not really" should resolve through it too — worth confirming
+    // empirically once this is live).
+    goalMode=focusResult.wants_change?"wants_change":"validation_only";
+  }else if(goalMode===null&&focusResult.wants_change){
+    goalMode="wants_change"; // stated outright, unprompted — skip the question entirely
+  }else if(goalMode===null&&focusStableTurns>=2&&focusResult.stage==="moving"){
+    notes.push("The focus has settled on: "+conversationFocus+". Naturally ask, once, plainly: is this something they'd want to work on, or did they mostly just want to get it out? Don't push toward either answer.");
+    goalMode="pending";
+  }
+  return notes.join(" ");
+}
+function readinessNoteFor(stage){
+  if(stage==="precontemplation")return "READINESS: they don't seem to see this as something to change yet. Stay with reflection and validation — do not suggest next steps.";
+  if(stage==="contemplation")return "READINESS: they're thinking about this but have no plan yet. Reflection is still the right move — don't jump to suggestions.";
+  return ""; // preparation/action/maintenance — no restriction, main prompt's normal rules apply
+}
 // Turns classify()'s scope/risk verdict into the one-turn instruction the main
 // prompt used to give itself when it was self-checking. Built in JS now, not
 // baked into the static (cached) prompt, since it only applies some turns.
@@ -425,17 +552,30 @@ if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content
 // to judge its own risk/scope (that self-check was dropped from the prompt).
 // Skipped for quick-reply chip taps — those options are pre-vetted, model-chosen
 // text, not free-form input, so there's nothing new to classify.
-const cls=opts.skipClassify?{risk:"none",scope:"in_scope"}:await classify(text);
+// classify() [risk/scope], classifyFocus(), and (once goalMode says the person
+// wants to work on something) classifyReadiness() all fire together — cost is
+// the slowest one, not the sum. Readiness only joins the batch once goalMode
+// is already "wants_change" from a PRIOR turn's resolution, so it doesn't run
+// (or cost anything) for purely validation-mode conversations.
+const wantsReadiness=goalMode==="wants_change";
+const [cls,focusResult,readinessResult]=opts.skipClassify
+  ?[{risk:"none",scope:"in_scope"},{stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false},readinessStage]
+  :await Promise.all([classify(text),classifyFocus(text),wantsReadiness?classifyReadiness(text):Promise.resolve(readinessStage)]);
 if(cls.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
+readinessStage=readinessResult;
 let ventCheckNote="";
 if(initialIntent==="vent"&&!ventCheckInDone&&userTurnCount>=VENT_CHECKIN_AT_TURN){
   ventCheckNote="They said early on they just wanted to vent — that's been the assumed goal. It's been a few turns now: this turn, naturally check in, genuinely open to either answer — are they looking to keep talking it through, or is there something they're trying to figure out or do about it? Don't push toward solutions, just ask.";
   ventCheckInDone=true;
 }
+const stateNote=buildStateNote(focusResult);
+const readinessNote=wantsReadiness?readinessNoteFor(readinessStage):"";
 const contextNote=[
   scopeDirectiveFor(cls),
   pendingSteeringNote,
-  ventCheckNote
+  ventCheckNote,
+  stateNote,
+  readinessNote
 ].filter(Boolean).join(" ");
 if(cls.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
