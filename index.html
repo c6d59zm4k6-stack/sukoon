@@ -147,6 +147,18 @@ function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 // single biggest driver of the TPM rate-limit hit, since "requested" tokens count
 // against the same per-minute budget as prompt tokens.
 const TOKEN_BUDGETS={classifier:150,evaluator:120,evaluator_audit:120,coder:100,memory:200,main:800,retry:800,quick_replies:80};
+// Streaming main reply: text is held back by this many characters (snapped to
+// the nearest word boundary) before it's shown, so the live deterministic
+// checks below get a head start on text before the user ever sees it.
+const STREAM_BUFFER_CHARS=40;
+// Re-running deterministicChecks on every single token is wasted work — only
+// re-check once the accumulated text has grown by at least this much since
+// the last check.
+const STREAM_CHECK_THROTTLE_CHARS=20;
+// Thrown by streamMainReply when a live check trips mid-stream. Caught in
+// sendMessage to decide the fallback path, kept distinct from a plain network/
+// parse error so the two can be logged and handled differently.
+class StreamLiveCheckError extends Error{constructor(issue){super("live check failed: "+issue);this.issue=issue}}
 
 async function callGroq(systemPrompt,messages,stage,maxTokens,_isRetryAttempt,overrideModel,overrideReasoning){
   const budget=maxTokens||TOKEN_BUDGETS[stage]||300;
@@ -219,6 +231,88 @@ function extractQuestion(text){const m=text.match(/([^.!?]*\?)/);return m?normal
 function questionSimilarity(a,b){const wa=new Set(a.split(" ").filter(Boolean)),wb=new Set(b.split(" ").filter(Boolean));if(!wa.size||!wb.size)return 0;let overlap=0;wa.forEach(w=>{if(wb.has(w))overlap++});return overlap/new Set([...wa,...wb]).size}
 function isRepeatedQuestion(text,askedQs){const q=extractQuestion(text);if(!q)return false;return askedQs.some(prior=>questionSimilarity(q,prior)>0.7)}
 function deterministicChecks(text,askedQs){if(wordCount(text)>MAX_REPLY_WORDS)return{pass:false,issue:"too_long"};if(wordCount(text)>=MIN_WORDS_FOR_READING_CHECK&&fleschKincaidGrade(text)>MAX_READING_GRADE)return{pass:false,issue:"reading_level_too_high"};if((text.match(/\?/g)||[]).length>1)return{pass:false,issue:"multiple_questions"};if(isRepeatedQuestion(text,askedQs||[]))return{pass:false,issue:"repeated_question"};return{pass:true,issue:null}}
+// Empty companion bubble the stream fills in progressively. Mirrors addBubble's
+// markup exactly so a streamed reply is visually identical to a non-streamed one.
+function addStreamingBubble(){const row=document.createElement("div");row.className="bubble-row companion";const bubble=document.createElement("div");bubble.className="bubble";bubble.textContent="";row.appendChild(bubble);chatEl.appendChild(row);scrollToBottom();return{row,bubble}}
+// Streams the main/retry reply straight to the screen via /api/chat-stream
+// instead of waiting for the full completion, using a small held-back buffer
+// (STREAM_BUFFER_CHARS) so the existing deterministicChecks() can run against
+// text BEFORE it's ever displayed. If a check trips, the stream is cancelled
+// and nothing further is shown — the caller (sendMessage) swaps in a fallback.
+// This buffered check is the only thing that can interrupt an in-progress
+// reply. The LLM evaluator (evaluateReply) still runs afterward, but only for
+// next-turn steering — it needs the complete text to judge properly and can't
+// run fast enough per-token to gate a live stream, so it's deliberately kept
+// post-hoc rather than blocking here. classify()/classifyFocus()/
+// classifyReadiness() are unaffected by any of this — they still run before
+// generation starts, same as before, over the existing non-streaming /api/chat.
+async function streamMainReply(systemPrompt,messages,stage,askedQs){
+  const budget=TOKEN_BUDGETS[stage]||800;
+  const modelToUse=SELECTED_MODEL;
+  const reasoningToUse=currentModelConfig().reasoning;
+  const disableThinkingToUse=!!currentModelConfig().disableThinking;
+  const _t0=performance.now();
+  let response;
+  try{
+    response=await fetch("/api/chat-stream",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system:systemPrompt,messages,model:modelToUse,max_tokens:budget,reasoning_effort:reasoningToUse,session_id:SESSION_ID,disable_thinking:disableThinkingToUse})});
+  }catch(e){
+    throw new Error((stage||"main")+" network error: "+(e&&e.message?e.message:String(e)));
+  }
+  if(!response.ok||!response.body){
+    let errMsg=(stage||"main")+" HTTP "+(response.status||0);
+    try{const errJson=await response.json();if(errJson&&errJson.error)errMsg=errJson.error}catch(e){}
+    throw new Error(errMsg);
+  }
+  const reader=response.body.getReader(),decoder=new TextDecoder();
+  let ndjsonBuffer="",fullText="",releasedLength=0,lastCheckedLength=0,typingCleared=false,liveBubble=null;
+  function releaseUpTo(safeLen){
+    if(safeLen<=releasedLength)return;
+    if(!typingCleared){removeTyping();typingCleared=true}
+    if(!liveBubble)liveBubble=addStreamingBubble();
+    releasedLength=safeLen;
+    liveBubble.bubble.textContent=fullText.slice(0,releasedLength);
+    scrollToBottom();
+  }
+  function abortLive(issue){
+    try{reader.cancel()}catch(e2){}
+    if(!typingCleared){removeTyping();typingCleared=true}
+    if(liveBubble)liveBubble.row.remove();
+    throw new StreamLiveCheckError(issue);
+  }
+  while(true){
+    let done,value;
+    try{({done,value}=await reader.read())}catch(e){throw new Error((stage||"main")+" stream read error: "+(e&&e.message?e.message:String(e)))}
+    if(done)break;
+    ndjsonBuffer+=decoder.decode(value,{stream:true});
+    const lines=ndjsonBuffer.split("\n");
+    ndjsonBuffer=lines.pop();
+    for(const line of lines){
+      if(!line.trim())continue;
+      let evt;
+      try{evt=JSON.parse(line)}catch(e){continue}
+      if(!evt.delta)continue;
+      fullText+=evt.delta;
+      // Check the FULL accumulated text (buffered tail included) so a problem
+      // is caught before its text is ever released, not after.
+      if(fullText.length-lastCheckedLength>=STREAM_CHECK_THROTTLE_CHARS){
+        lastCheckedLength=fullText.length;
+        const det=deterministicChecks(fullText,askedQs);
+        if(!det.pass)abortLive(det.issue);
+      }
+      const rawSafe=Math.max(0,fullText.length-STREAM_BUFFER_CHARS);
+      const spaceIdx=fullText.lastIndexOf(" ",rawSafe);
+      releaseUpTo(spaceIdx>releasedLength?spaceIdx:releasedLength);
+    }
+  }
+  // Final check over the complete text — catches anything only detectable once
+  // the whole reply is in (e.g. total word count crossing the limit right at
+  // the end, inside what was still the held-back buffer).
+  const finalDet=deterministicChecks(fullText,askedQs);
+  if(!finalDet.pass)abortLive(finalDet.issue);
+  releaseUpTo(fullText.length);
+  console.log("[Sukoon] TIMING",stage,"("+modelToUse+")","took",Math.round(performance.now()-_t0),"ms (streamed)");
+  return{reply:fullText,row:liveBubble?liveBubble.row:null,bubble:liveBubble?liveBubble.bubble:null};
+}
 function safeParseJSON(text){try{return JSON.parse(text.replace(/```json|```/g,"").trim())}catch(e){return null}}
 const MI_TARGETS={rq_ratio:{target:1,tolerance:.15,label:"Reflection:Question ratio"},pct_open:{target:.70,tolerance:.15,label:"Open questions (of all questions)"},pct_complex:{target:.30,tolerance:.15,label:"Complex reflections (of all reflections)"}};
 const MIN_CODED_TURNS_BEFORE_STEERING=4;const emptyTally=()=>({simple_reflection:0,complex_reflection:0,open_question:0,closed_question:0,advice:0,other:0,turns:0});
@@ -619,13 +713,52 @@ const contextNote=[
 ].filter(Boolean).join(" ");
 if(cls.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
-try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseReplyPlain(raw);console.log("[Sukoon] parsed reply:",parsed);
+try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);
 lastCandidateActivity=(cls.risk!=="elevated_distress"&&cls.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
-let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);
-if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
-else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
-if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply()};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply()}}}
-removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});const replyRow=addBubble("assistant",parsed.reply,chip,null);if(!isFallback){codeCompanionTurn(text,parsed.reply);maybeAttachQuickReplies(replyRow,parsed.reply,myGeneration)}else{quickReplyStreak=0}
+let finalReplyText,replyRow,isFallback=false;
+try{
+  const streamResult=await streamMainReply(systemPrompt,windowedHistory,"main",askedQuestions);
+  finalReplyText=streamResult.reply;replyRow=streamResult.row;
+  console.log("[Sukoon] streamed main reply:",finalReplyText);
+}catch(e){
+  // Live deterministic-check trip (StreamLiveCheckError) or a network/stream
+  // failure both land here — either way, nothing usable was left on screen
+  // (streamMainReply already removed its own partial bubble), so swap in a
+  // fallback. Unlike the old blocking flow, there is no corrective retry-with-
+  // a-note step anymore: once generation is streaming live to the user, there
+  // is no "regenerate before anyone sees it" option, only show-or-swap.
+  if(e instanceof StreamLiveCheckError)console.log("[Sukoon] live check failed mid-stream, showing fallback instead:",e.issue);
+  else console.error("[Sukoon DEBUG] stream failed, showing fallback:",e);
+  removeTyping();
+  finalReplyText=pickFallbackReply();isFallback=true;
+  replyRow=addBubble("assistant",finalReplyText);
+}
+let chip=null;
+if(!isFallback&&lastCandidateActivity&&finalReplyText.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){
+  chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id);
+  if(replyRow){const chipEl=document.createElement("div");chipEl.className="chip";chipEl.title=chip.desc;chipEl.innerHTML="🧭 Suggested: <b>"+chip.title+"</b> · "+chip.duration;replyRow.appendChild(chipEl);scrollToBottom()}
+}
+if(!isFallback){const askedQ=extractQuestion(finalReplyText);if(askedQ)askedQuestions.push(askedQ)}
+history.push({role:"assistant",content:finalReplyText});
+if(!isFallback){
+  codeCompanionTurn(text,finalReplyText);
+  if(replyRow)maybeAttachQuickReplies(replyRow,finalReplyText,myGeneration);
+  // Post-hoc only, from here down — the reply is already fully on screen, so
+  // nothing below can block or replace it. Every evaluator issue now gets the
+  // same "defer, don't block" treatment COMPLEX_EVALUATOR_ISSUES already had
+  // (audit for the ones that need a second opinion, direct steering note for
+  // the rest like medication_mention/out_of_scope) — blocking retry isn't
+  // compatible with a reply the user already watched stream in.
+  evaluateReply(text,finalReplyText).then(evalResult=>{
+    if(evalResult.pass)return;
+    console.log("[Sukoon] post-hoc evaluator flagged (steering only, already shown):",evalResult.issue);
+    if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){
+      auditComplexFlag(text,finalReplyText,evalResult.issue);
+    }else{
+      pendingSteeringNote="Your previous reply was flagged for "+evalResult.issue+" — this turn, deliberately avoid repeating that pattern.";
+    }
+  }).catch(()=>{});
+}else{quickReplyStreak=0}
 }catch(e){removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
