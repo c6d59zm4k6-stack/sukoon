@@ -310,7 +310,7 @@ async function classify(latestUserText){const recentContext=history.slice(-6).ma
 // state directly, same as memory/scope today.
 // Model IDs confirmed against the Groq console.
 const FOCUS_MODEL="openai/gpt-oss-120b";
-const READINESS_MODEL="qwen/qwen3.6-27b";
+const READINESS_MODEL="openai/gpt-oss-120b";
 const FOCUS_SYSTEM=`Task: read a short supportive chat. Decide what matters most right now, and whether it just changed.
 
 Output ONLY this JSON, nothing else:
@@ -389,7 +389,7 @@ async function classifyReadiness(latestUserText){
   const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
   const userContent="Previous readiness: "+(readinessStage||"(none)")+"\n\n"+recentContext+"\nuser: "+latestUserText;
   try{
-    const raw=await callGroqDirect(READINESS_SYSTEM,userContent,READINESS_MODEL,null,1000,"readiness");
+    const raw=await callGroqDirect(READINESS_SYSTEM,userContent,READINESS_MODEL,"low",1000,"readiness");
     const parsed=safeParseJSON(raw);
     if(parsed&&parsed.readiness)return parsed.readiness;
   }catch(e){console.error("[Sukoon] readiness classifier failed:",e)}
