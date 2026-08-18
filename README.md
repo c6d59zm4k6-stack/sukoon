@@ -1,4 +1,4 @@
-# Sukoon — Groq + Vercel prototype
+# Sukoon — Mental Wellbeing Chat companion prototype (based on Vercel, OpenRouter, Groq implementation)
 
 Sukoon is a browser-based prototype of a reflective mental-wellbeing companion.
 
