@@ -367,17 +367,19 @@ user: honestly I don't know. maybe I'd try setting a timer if you have ideas
 Output: {"readiness":"preparation"}
 
 Output only the JSON object. No explanation, no markdown.`;
-async function callGroqDirect(system,user,model,reasoningEffort){
-  const response=await fetch("/api/groq-classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system,user,model,max_tokens:150,reasoning_effort:reasoningEffort})});
+async function callGroqDirect(system,user,model,reasoningEffort,maxTokens,stage){
+  const _t0=performance.now();
+  const response=await fetch("/api/groq-classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({system,user,model,max_tokens:maxTokens||150,reasoning_effort:reasoningEffort})});
   const data=await response.json();
-  if(!response.ok)throw new Error(data?.error||"groq classify failed");
+  console.log("[Sukoon] TIMING",stage||"groq_classify","("+model+")","took",Math.round(performance.now()-_t0),"ms");
+  if(!response.ok)throw new Error((data?.error||"groq classify failed")+(data?.failedGeneration?(" | raw: "+data.failedGeneration):""));
   return data.text||"";
 }
 async function classifyFocus(latestUserText){
   const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
   const userContent="Previous focus: "+(conversationFocus||"(none)")+"\n\n"+recentContext+"\nuser: "+latestUserText;
   try{
-    const raw=await callGroqDirect(FOCUS_SYSTEM,userContent,FOCUS_MODEL,"low");
+    const raw=await callGroqDirect(FOCUS_SYSTEM,userContent,FOCUS_MODEL,"low",1000,"focus");
     const parsed=safeParseJSON(raw);
     if(parsed&&typeof parsed.core_focus==="string")return parsed;
   }catch(e){console.error("[Sukoon] focus classifier failed:",e)}
@@ -387,7 +389,7 @@ async function classifyReadiness(latestUserText){
   const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
   const userContent="Previous readiness: "+(readinessStage||"(none)")+"\n\n"+recentContext+"\nuser: "+latestUserText;
   try{
-    const raw=await callGroqDirect(READINESS_SYSTEM,userContent,READINESS_MODEL,null);
+    const raw=await callGroqDirect(READINESS_SYSTEM,userContent,READINESS_MODEL,null,200,"readiness");
     const parsed=safeParseJSON(raw);
     if(parsed&&parsed.readiness)return parsed.readiness;
   }catch(e){console.error("[Sukoon] readiness classifier failed:",e)}
