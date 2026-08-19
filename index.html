@@ -257,6 +257,13 @@ let conversationFocus="",focusStableTurns=0,goalMode=null,readinessStage=null,de
 // See maxReachedNoteFor(). Reset alongside the other flags on a genuine focus
 // change (buildStateNote), since a new topic deserves a fresh budget.
 let movingStageTurnCount=0,hypothesisRejectCount=0,landingForced=false;
+// One-shot per topic-era, same pattern as depthPushed — without this, the
+// same underlying tension re-fires every turn it's still present, even when
+// it's just reworded restatement of a pull already reflected on (confirmed
+// in testing: "shout vs professional" -> "shout vs calm" -> "shout vs signals
+// acceptance" fired the identical note 4 turns running). Resets alongside
+// depthPushed on a genuine topic change — see buildStateNote.
+let tensionSurfaced=false;
 const MAX_MOVING_TURNS=12,MAX_HYPOTHESIS_REJECTIONS=3;
 // THIN-REPLY side: tracks short replies specifically following OPEN questions
 // (closed-question short answers are expected and don't count). Behavior on
@@ -514,9 +521,18 @@ function buildStateNote(focusResult){
   // >=3 threshold that sets depthPushed in the first place can never be
   // reached in a conversation that keeps deepening (confirmed by replaying
   // a real transcript against this logic before landing on this fix).
-  if(focusResult.focus_changed&&(goalMode===null||goalMode==="pending")){
+  // A focus_changed turn that also carries a tension is NOT a genuinely new
+  // topic, even pre-lock — tension requires two things in active conflict,
+  // which only shows up once real context has built up on the same thread.
+  // Without this carve-out, reworded restatements of the same tension kept
+  // tripping focus_changed before goalMode ever locked, so focusStableTurns
+  // never reached the threshold that sets goalMode in the first place —
+  // confirmed by replaying a real transcript where goalMode stayed null the
+  // entire conversation for exactly this reason.
+  const genuinelyNewTopic=focusResult.focus_changed&&!focusResult.tension&&(goalMode===null||goalMode==="pending");
+  if(genuinelyNewTopic){
     focusStableTurns=0;depthPushed=false;landingOffered=false;turnsSinceDepthPush=0;
-    hypothesisRejectCount=0;landingForced=false;
+    hypothesisRejectCount=0;landingForced=false;tensionSurfaced=false;
   }else{
     focusStableTurns++;
   }
@@ -622,6 +638,8 @@ function stageNoteFor(stage){
 // rather than introducing a new unexplained one.
 function tensionNoteFor(tension){
   if(!tension||!tension.a||!tension.b)return"";
+  if(tensionSurfaced)return""; // already reflected once this thread — let other notes take a turn instead of re-stating the same pull
+  tensionSurfaced=true;
   return"There's a real pull between two things here: "+tension.a+" — but also "+tension.b+". Name that tension directly this turn as a double-sided reflection (see section 6) — don't just validate one side of it, and don't ask another question yet.";
 }
 // DIRECT ASK: catches "how can you help me" / "what should I do" style asks —
