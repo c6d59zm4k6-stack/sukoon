@@ -219,7 +219,13 @@ function fleschKincaidGrade(text){
 function extractQuestion(text){const m=text.match(/([^.!?]*\?)/);return m?normalise(m[1]).trim():null}
 function questionSimilarity(a,b){const wa=new Set(a.split(" ").filter(Boolean)),wb=new Set(b.split(" ").filter(Boolean));if(!wa.size||!wb.size)return 0;let overlap=0;wa.forEach(w=>{if(wb.has(w))overlap++});return overlap/new Set([...wa,...wb]).size}
 function isRepeatedQuestion(text,askedQs){const q=extractQuestion(text);if(!q)return false;return askedQs.some(prior=>questionSimilarity(q,prior)>0.7)}
-function deterministicChecks(text,askedQs){if(wordCount(text)>MAX_REPLY_WORDS)return{pass:false,issue:"too_long"};if(wordCount(text)>=MIN_WORDS_FOR_READING_CHECK&&fleschKincaidGrade(text)>MAX_READING_GRADE)return{pass:false,issue:"reading_level_too_high"};if((text.match(/\?/g)||[]).length>1)return{pass:false,issue:"multiple_questions"};if(isRepeatedQuestion(text,askedQs||[]))return{pass:false,issue:"repeated_question"};return{pass:true,issue:null}}
+// MAX_QUESTION_MARKS raised from 1 to 3: a single question is sometimes asked
+// in 2-3 short connected parts ("what happened after — did you say anything,
+// or just let it go?"). That's still one question, not several — see prompt.js
+// §3. Bubble-splitting (splitIntoBubbles) can also legitimately produce more
+// than one "?" across separate messages, which this check must not punish.
+const MAX_QUESTION_MARKS=3;
+function deterministicChecks(text,askedQs){if(wordCount(text)>MAX_REPLY_WORDS)return{pass:false,issue:"too_long"};if(wordCount(text)>=MIN_WORDS_FOR_READING_CHECK&&fleschKincaidGrade(text)>MAX_READING_GRADE)return{pass:false,issue:"reading_level_too_high"};if((text.match(/\?/g)||[]).length>MAX_QUESTION_MARKS)return{pass:false,issue:"multiple_questions"};if(isRepeatedQuestion(text,askedQs||[]))return{pass:false,issue:"repeated_question"};return{pass:true,issue:null}}
 function safeParseJSON(text){try{return JSON.parse(text.replace(/```json|```/g,"").trim())}catch(e){return null}}
 const MI_TARGETS={rq_ratio:{target:1,tolerance:.15,label:"Reflection:Question ratio"},pct_open:{target:.70,tolerance:.15,label:"Open questions (of all questions)"},pct_complex:{target:.30,tolerance:.15,label:"Complex reflections (of all reflections)"}};
 const MIN_CODED_TURNS_BEFORE_STEERING=4;const emptyTally=()=>({simple_reflection:0,complex_reflection:0,open_question:0,closed_question:0,advice:0,other:0,turns:0});
@@ -245,6 +251,30 @@ let history=[],memoryFacts=[],memoryEnabled=true,usedActivityIds=new Set(),lastC
 // Known simplification: once resolved, goalMode is not currently re-opened by
 // later unprompted change-talk — that re-trigger case is deferred, not built.
 let conversationFocus="",focusStableTurns=0,goalMode=null,readinessStage=null,depthPushed=false,landingOffered=false,turnsSinceDepthPush=0;
+// --- Min-max gating + thin-reply adaptation state (all plain JS, no AI calls) ---
+// MAX side: turns spent in "moving" without landing, and consecutive rejected
+// hypotheses, both force an honest partial landing once either cap is hit.
+// See maxReachedNoteFor(). Reset alongside the other flags on a genuine focus
+// change (buildStateNote), since a new topic deserves a fresh budget.
+let movingStageTurnCount=0,hypothesisRejectCount=0,landingForced=false;
+const MAX_MOVING_TURNS=12,MAX_HYPOTHESIS_REJECTIONS=3;
+// THIN-REPLY side: tracks short replies specifically following OPEN questions
+// (closed-question short answers are expected and don't count). Behavior on
+// trigger differs by stage — see thinReplyNoteFor().
+let thinReplyStreak=0,lastQuestionType=null;
+const THIN_REPLY_WORD_THRESHOLD=5,THIN_REPLY_STREAK_TRIGGER=2;
+// HYPOTHESIS side: cheap regex proxies (same style as VENT_PATTERNS/CRISIS_PATTERNS
+// below) for "did the last reply offer a testable guess" and "did the user just
+// reject it" — feeds the rejection-cap above. No new AI call.
+let pendingHypothesisCheck=false;
+const HYPOTHESIS_CHECK_PATTERN=/does that fit|does that sound right|sound closer|does this land|am i reading|is that fair|does that feel true|does that ring true/i;
+const PUSHBACK_PATTERN=/\bnot really\b|\bnot quite\b|\bnot exactly\b|\bnah\b|\bnot the case\b|\bnot it\b|^no[,.]|\bactually no\b|\bdon'?t think so\b|\bthat'?s not\b/i;
+function looksLikeHypothesisCheck(text){return HYPOTHESIS_CHECK_PATTERN.test(text)}
+function looksLikePushback(text){return PUSHBACK_PATTERN.test(normalise(text))}
+// Same closed-question heuristic already used by regexFallbackCodes (line ~228),
+// reused here synchronously so thin-reply tracking doesn't wait on the async coder.
+const CLOSED_QUESTION_STARTER=/^(do|does|did|is|are|was|were|can|could|will|would|have|has|had|should|any|would you)\b/;
+function classifyQuestionTypeLocal(replyText){const q=extractQuestion(replyText);if(!q)return null;return CLOSED_QUESTION_STARTER.test(q)?"closed":"open"}
 // Bumped at the start of every sendMessage() — lets the async quick-reply
 // fetch tell whether it's still answering the latest turn by the time it
 // resolves, or a newer message has already started (see maybeAttachQuickReplies).
@@ -281,6 +311,36 @@ function buildQuickReplyChips(quickReplies){
   return wrap.children.length?wrap:null;
 }
 function addBubble(role,text,chipActivity,quickReplies){const row=document.createElement("div");row.className="bubble-row "+(role==="user"?"user":"companion");const bubble=document.createElement("div");bubble.className="bubble";bubble.textContent=text;row.appendChild(bubble);if(chipActivity){const chip=document.createElement("div");chip.className="chip";chip.title=chipActivity.desc;chip.innerHTML="🧭 Suggested: <b>"+chipActivity.title+"</b> · "+chipActivity.duration;row.appendChild(chip)}const qrWrap=buildQuickReplyChips(quickReplies);if(qrWrap)row.appendChild(qrWrap);chatEl.appendChild(row);scrollToBottom();return row}
+// Splits an already-checked reply into up to BUBBLE_SPLIT_MAX messages on
+// blank-line paragraph breaks (prompt.js §3B). Deterministic, no AI call, no
+// dependence on the model reliably following a delimiter instruction — same
+// reasoning as why deterministicChecks() is regex, not a model judgment.
+// Overflow beyond the cap is merged into the last bubble, never dropped.
+const BUBBLE_SPLIT_MAX=3,BUBBLE_STAGGER_MS=450;
+function splitIntoBubbles(text){
+  let parts=(text||"").split(/\n\s*\n/).map(p=>p.trim()).filter(Boolean);
+  if(!parts.length)parts=[(text||"").trim()];
+  if(parts.length>BUBBLE_SPLIT_MAX){
+    const head=parts.slice(0,BUBBLE_SPLIT_MAX-1),tail=parts.slice(BUBBLE_SPLIT_MAX-1).join(" ");
+    parts=[...head,tail];
+  }
+  return parts;
+}
+// evaluateReply()/deterministicChecks()/extractQuestion() all already ran on
+// the FULL joined text before this is called (see sendMessage) — splitting is
+// purely a rendering step after every check has passed on the whole reply.
+// chip/quickReplies attach only to the last bubble. Returns the last row, so
+// callers (codeCompanionTurn, maybeAttachQuickReplies) get the right target.
+async function addBubbleSequence(role,text,chipActivity,quickReplies){
+  const parts=splitIntoBubbles(text);
+  let lastRow=null;
+  for(let i=0;i<parts.length;i++){
+    if(i>0){addTyping();await sleep(BUBBLE_STAGGER_MS);removeTyping()}
+    const isLast=i===parts.length-1;
+    lastRow=addBubble(role,parts[i],isLast?chipActivity:null,isLast?quickReplies:null);
+  }
+  return lastRow;
+}
 // Appends quick-reply chips to an already-displayed bubble, once the separate
 // small-model call resolves — never blocks or delays the main reply itself.
 function appendQuickReplies(row,quickReplies){
@@ -411,13 +471,24 @@ async function classifyReadiness(latestUserText){
 }
 // Plain code, not AI — decides what (if anything) the main model needs to
 // hear based on the focus classifier's latest read, and advances goalMode.
+// Returns {focusChangedNote, otherNote} instead of one joined string — kept
+// separate so buildArbiterNote() can prioritize a genuine focus change over
+// everything else, rather than the two getting silently concatenated.
 function buildStateNote(focusResult){
-  const notes=[];
+  let focusChangedNote="",otherNote="";
   if(focusResult.focus_changed&&conversationFocus){
-    notes.push("FOCUS just changed to: "+focusResult.core_focus+". Check in on this, in your own words, before moving on to anything else — this takes priority over whatever you were about to ask next.");
+    focusChangedNote="FOCUS just changed to: "+focusResult.core_focus+". Check in on this, in your own words, before moving on to anything else — this takes priority over whatever you were about to ask next.";
   }
   conversationFocus=focusResult.core_focus||conversationFocus;
-  if(focusResult.focus_changed){focusStableTurns=0;depthPushed=false;landingOffered=false;turnsSinceDepthPush=0}else focusStableTurns++;
+  if(focusResult.focus_changed){
+    // Genuine topic shift — everything gated on "how long have we been on
+    // this" restarts, including the new max-cap and thin-reply counters.
+    focusStableTurns=0;depthPushed=false;landingOffered=false;turnsSinceDepthPush=0;
+    movingStageTurnCount=0;hypothesisRejectCount=0;landingForced=false;thinReplyStreak=0;
+  }else{
+    focusStableTurns++;
+    if(focusResult.stage==="moving")movingStageTurnCount++;
+  }
   if(goalMode==="validation_only"&&depthPushed&&!landingOffered)turnsSinceDepthPush++;
   if(goalMode==="pending"){
     // Last turn we asked "work on it, or just wanted to get it out?" — this
@@ -429,7 +500,7 @@ function buildStateNote(focusResult){
   }else if(goalMode===null&&focusResult.wants_change){
     goalMode="wants_change"; // stated outright, unprompted — skip the question entirely
   }else if(goalMode===null&&focusStableTurns>=2&&focusResult.stage==="moving"){
-    notes.push("The focus has settled on: "+conversationFocus+". Naturally ask, once, plainly: is this something they'd want to work on, or did they mostly just want to get it out? Don't push toward either answer.");
+    otherNote="The focus has settled on: "+conversationFocus+". Naturally ask, once, plainly: is this something they'd want to work on, or did they mostly just want to get it out? Don't push toward either answer.";
     goalMode="pending";
   }else if(goalMode==="wants_change"&&!depthPushed&&focusStableTurns>=3){
     // The gap this plugs: once the goal is locked in, the only note left in
@@ -438,23 +509,68 @@ function buildStateNote(focusResult){
     // keeps gathering surface detail forever, since nothing tells it it's
     // gathered enough. Fires once per focus, not every turn, so it's a nudge
     // and not a nag if the model doesn't shift right away.
-    notes.push("You have a clear, concrete picture of what's going on now. Shift from gathering more detail to exploring what this is like for them — how they feel about it, what it's costing them, or what pulls them two ways about it. Don't ask another fact-gathering question this turn.");
+    otherNote="You have a clear, concrete picture of what's going on now. Shift from gathering more detail to exploring what this is like for them — how they feel about it, what it's costing them, or what pulls them two ways about it. Don't ask another fact-gathering question this turn.";
     depthPushed=true;
   }else if(goalMode==="validation_only"&&!depthPushed&&focusStableTurns>=3){
     // Mirror of the wants_change push above, but "deeper" means something
     // different here: no plan to build toward, advice stays off either way.
     // So this just means stop probing for detail and reflect the feeling.
-    notes.push("You have enough of the picture. Stop asking clarifying questions — reflect back what this seems to feel like for them, and let the conversation settle rather than digging for more detail.");
+    otherNote="You have enough of the picture. Stop asking clarifying questions — reflect back what this seems to feel like for them, and let the conversation settle rather than digging for more detail.";
     depthPushed=true;
   }else if(goalMode==="validation_only"&&depthPushed&&!landingOffered&&turnsSinceDepthPush>=2){
     // A couple of turns after the reflection push, offer an actual landing
     // instead of continuing to reflect indefinitely: name the feeling, then
     // hand them the choice — keep talking, try something small to release
     // it, or pause and come back later. Options, not a prescription.
-    notes.push("They've had space to sit with this. Offer a natural landing: name what they seem to be feeling, then invite them to either keep sharing anything else on their mind, or gently suggest something small that might help release the feeling right now — like a short walk, a minute of slow breathing, or music (ask what usually helps them rather than prescribing one thing) — or offer to pause here and pick this back up later. Let them choose; don't push any one option.");
+    otherNote="They've had space to sit with this. Offer a natural landing: name what they seem to be feeling, then invite them to either keep sharing anything else on their mind, or gently suggest something small that might help release the feeling right now — like a short walk, a minute of slow breathing, or music (ask what usually helps them rather than prescribing one thing) — or offer to pause here and pick this back up later. Let them choose; don't push any one option.";
     landingOffered=true;
   }
-  return notes.join(" ");
+  return{focusChangedNote,otherNote};
+}
+// --- New helper notes (all plain JS, no AI) — see min-max gating comment above ---
+// MAX cap: turn ceiling OR hypothesis-rejection ceiling, whichever hits first.
+// One-shot per focus (landingForced), same pattern as depthPushed/landingOffered.
+function maxReachedNoteFor(){
+  if(landingForced)return"";
+  if(movingStageTurnCount>=MAX_MOVING_TURNS||hypothesisRejectCount>=MAX_HYPOTHESIS_REJECTIONS){
+    landingForced=true;
+    const expertLine=goalMode==="wants_change"?", or connect with a human expert to go deeper on this":"";
+    return"You've been exploring this for a while without landing on a clear next step. This turn, be honest about that: briefly name what you've understood so far, even if it's partial, then offer a plain choice — pause and pick this up later, keep talking with no pressure"+expertLine+". Don't ask another exploratory question this turn.";
+  }
+  return"";
+}
+// THIN-REPLY adaptation: behavior differs by stage. Understanding-stage thin
+// replies get a nudge toward elaboration (what kind of detail is wanted).
+// Moving-stage thin replies switch the move type instead (closed question or
+// affirmation), since by then an open question is what's producing the thinness.
+function thinReplyNoteFor(stage){
+  if(thinReplyStreak<THIN_REPLY_STREAK_TRIGGER)return"";
+  if(stage==="understanding"){
+    return"Replies have stayed short after a couple of open prompts. This turn, nudge for a bigger response by naming the kind of detail you want — for example, ask them to say more about a specific moment: how they felt, how they reacted, what the other person was doing. Keep it to one plain ask.";
+  }
+  return"Replies have stayed short after open questions. Switch this turn — use a closed or multiple-choice question, or a brief affirmation, instead of another open question.";
+}
+// OARS-by-stage default — the arbiter's fallback when nothing higher-priority
+// fires. Understanding favors open questions + minimal encouragers only (no
+// affirmation yet, nothing concrete to affirm). Moving makes a tentative read
+// the default move, not just an occasional one — see prompt.js §6/§30.
+function stageNoteFor(stage){
+  if(stage==="understanding"){
+    return"Still gathering the picture. Favor open questions and short minimal encouragers ('mm.', 'right...', 'yeah, go on.') — hold off on affirmations, there's nothing concrete to affirm yet.";
+  }
+  if(stage==="moving"){
+    return"Enough is on the table to work with. Default to offering a tentative read this turn (a complex reflection they can correct) rather than another plain open question — affirmation and summary are both fair game here too.";
+  }
+  return"";
+}
+// The arbiter: picks exactly ONE "what to do this turn" directive by priority,
+// instead of concatenating every note that happens to be non-empty. Scope/audit
+// guardrails are a different category (constraints, not competing moves) so
+// they're always passed through alongside whichever single move note wins.
+function buildArbiterNote({scopeGuardrail,pendingSteeringNote,maxReachedNote,thinReplyNote,focusChangedNote,ventCheckNote,otherStateNote,readinessNote,stageDefaultNote}){
+  const guardrails=[scopeGuardrail,pendingSteeringNote].filter(Boolean).join(" ");
+  const moveNote=maxReachedNote||thinReplyNote||focusChangedNote||ventCheckNote||otherStateNote||readinessNote||stageDefaultNote||"";
+  return[guardrails,moveNote].filter(Boolean).join(" ");
 }
 function readinessNoteFor(stage){
   if(stage==="precontemplation")return "READINESS: they don't seem to see this as something to change yet. Stay with reflection and validation — do not suggest next steps.";
@@ -585,6 +701,16 @@ function buildCanonicalSystemPrompt(contextNote){
 }
 async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;const myGeneration=++replyGeneration;document.querySelector(".app").classList.add("compact");clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;
 if(userTurnCount===1){const n=normalise(text);if(VENT_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="vent"}
+// --- Deterministic, synchronous tracking (no AI) against THIS user message,
+// using signals recorded from the PREVIOUS assistant turn. Both feed the
+// arbiter below; neither adds a network call or latency. ---
+if(pendingHypothesisCheck){
+  if(looksLikePushback(text))hypothesisRejectCount++;else hypothesisRejectCount=0;
+  pendingHypothesisCheck=false;
+}
+if(lastQuestionType==="open"){
+  if(wordCount(text)<=THIN_REPLY_WORD_THRESHOLD)thinReplyStreak++;else thinReplyStreak=0;
+}
 if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});return}sendBtn.disabled=true;addTyping();
 // Standalone classify() call again — decides risk/scope BEFORE generation, so a
 // crisis message never spends a generation call at all, and main is never asked
@@ -607,17 +733,31 @@ if(initialIntent==="vent"&&!ventCheckInDone&&userTurnCount>=VENT_CHECKIN_AT_TURN
   ventCheckNote="They said early on they just wanted to vent — that's been the assumed goal. It's been a few turns now: this turn, naturally check in, genuinely open to either answer — are they looking to keep talking it through, or is there something they're trying to figure out or do about it? Don't push toward solutions, just ask.";
   ventCheckInDone=true;
 }
-const stateNote=buildStateNote(focusResult);
+// buildStateNote() also advances focusStableTurns/movingStageTurnCount/goalMode
+// as a side effect — must run before the notes below that read those values.
+const{focusChangedNote,otherNote}=buildStateNote(focusResult);
 const readinessNote=wantsReadiness?readinessNoteFor(readinessStage):"";
-console.log("[Sukoon] focus result:",focusResult,"| goalMode:",goalMode,"| stateNote:",stateNote||"(empty)");
+const maxReachedNote=maxReachedNoteFor();
+const thinReplyNote=thinReplyNoteFor(focusResult.stage);
+const stageDefaultNote=stageNoteFor(focusResult.stage);
+console.log("[Sukoon] focus result:",focusResult,"| goalMode:",goalMode,"| focusChangedNote:",focusChangedNote||"(empty)","| otherNote:",otherNote||"(empty)");
 console.log("[Sukoon] readiness result:",readinessResult,"| wantsReadiness:",wantsReadiness,"| readinessNote:",readinessNote||"(empty)");
-const contextNote=[
-  scopeDirectiveFor(cls),
+console.log("[Sukoon] maxReachedNote:",maxReachedNote||"(empty)","| thinReplyNote:",thinReplyNote||"(empty)","| thinReplyStreak:",thinReplyStreak+"/"+THIN_REPLY_STREAK_TRIGGER,"| movingStageTurnCount:",movingStageTurnCount+"/"+MAX_MOVING_TURNS,"| hypothesisRejectCount:",hypothesisRejectCount+"/"+MAX_HYPOTHESIS_REJECTIONS,"| landingForced:",landingForced);
+// The arbiter — see buildArbiterNote() above. Picks exactly ONE "what to do
+// this turn" move directive by priority instead of concatenating every note
+// that happens to be non-empty; scope/audit guardrails still always pass through.
+const contextNote=buildArbiterNote({
+  scopeGuardrail:scopeDirectiveFor(cls),
   pendingSteeringNote,
+  maxReachedNote,
+  thinReplyNote,
+  focusChangedNote,
   ventCheckNote,
-  stateNote,
-  readinessNote
-].filter(Boolean).join(" ");
+  otherStateNote:otherNote,
+  readinessNote,
+  stageDefaultNote
+});
+console.log("[Sukoon] arbiter contextNote:",contextNote||"(empty)");
 if(cls.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
 try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseReplyPlain(raw);console.log("[Sukoon] parsed reply:",parsed);
@@ -626,7 +766,12 @@ let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] eval
 if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
 else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
 if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply()};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply()}}}
-removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}history.push({role:"assistant",content:parsed.reply});const replyRow=addBubble("assistant",parsed.reply,chip,null);if(!isFallback){codeCompanionTurn(text,parsed.reply);maybeAttachQuickReplies(replyRow,parsed.reply,myGeneration)}else{quickReplyStreak=0}
+removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}
+// Set from the FINAL accepted reply (post-retry/fallback), all checks already
+// passed — feeds next turn's pushback/thin-reply tracking at the top of this
+// function. Skipped for fallback text, which isn't a real conversational move.
+if(!isFallback){pendingHypothesisCheck=looksLikeHypothesisCheck(parsed.reply);lastQuestionType=classifyQuestionTypeLocal(parsed.reply)}
+history.push({role:"assistant",content:parsed.reply});const replyRow=await addBubbleSequence("assistant",parsed.reply,chip,null);if(!isFallback){codeCompanionTurn(text,parsed.reply);maybeAttachQuickReplies(replyRow,parsed.reply,myGeneration)}else{quickReplyStreak=0}
 }catch(e){removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
