@@ -392,10 +392,10 @@ async function classify(latestUserText){const recentContext=history.slice(-6).ma
 // Model IDs confirmed against the Groq console.
 const FOCUS_MODEL="openai/gpt-oss-120b";
 const READINESS_MODEL="openai/gpt-oss-120b";
-const FOCUS_SYSTEM=`Task: read a short supportive chat. Decide what matters most right now, and whether it just changed.
+const FOCUS_SYSTEM=`Task: read a short supportive chat. Decide what matters most right now, whether it just changed, and whether two things are genuinely pulling against each other.
 
 Output ONLY this JSON, nothing else:
-{"stage":"understanding"|"moving","core_focus":"<5-8 words>","focus_changed":true|false,"wants_change":true|false}
+{"stage":"understanding"|"moving","core_focus":"<5-8 words>","focus_changed":true|false,"wants_change":true|false,"tension":null|{"a":"<short phrase>","b":"<short phrase>"}}
 
 stage: "understanding" = still gathering facts or background, no feeling/reason explored yet. "moving" = a feeling, reason, or next step tied to the core focus is being explored.
 
@@ -404,6 +404,8 @@ core_focus: the ONE thing driving how the person feels or what they want right n
 focus_changed: true ONLY if the newest message reveals something MORE central than before - not just another fact about the same thing. False if just more detail, or if this is the first message.
 
 wants_change: true ONLY if they directly and unmistakably said they want to change, fix, stop, or improve the core_focus itself ("I want to stop doing this"). False if only describing or reacting to it, even with frustration.
+
+tension: null almost always. Only set it when the person's own words show two things genuinely pulling against each other AT THE SAME TIME - not two separate facts said one after another, not a past-vs-present contrast, an actual internal pull ("part of me wanted X, but I also didn't want Y"). Each side is a short phrase in their terms. Do not manufacture a tension merely to sound insightful - if you are not sure it is really there, output null.
 
 You get the previous focus you reported last turn. Keep it unless the new message clearly points somewhere more central.
 
@@ -414,12 +416,19 @@ assistant: what happened after that?
 user: I just said okay and left. but I keep replaying it
 assistant: what part keeps coming back?
 user: that I didn't say anything back. I never do
-Output: {"stage":"moving","core_focus":"never speaking up when criticized","focus_changed":true,"wants_change":false}
+Output: {"stage":"moving","core_focus":"never speaking up when criticized","focus_changed":true,"wants_change":false,"tension":null}
 
 Example B:
 Previous focus: (none)
 user: I procrastinate a lot and I want to stop
-Output: {"stage":"understanding","core_focus":"wants to stop procrastinating","focus_changed":true,"wants_change":true}
+Output: {"stage":"understanding","core_focus":"wants to stop procrastinating","focus_changed":true,"wants_change":true,"tension":null}
+
+Example C (tension):
+Previous focus: unsure whether to have confronted a rude coworker
+user: should I have said something back to him
+assistant: what stopped you?
+user: I try to stay professional, I don't want to be the kind of person who snaps at people
+Output: {"stage":"moving","core_focus":"staying professional under provocation","focus_changed":false,"wants_change":false,"tension":{"a":"wanting to have stood up for himself in the moment","b":"valuing being someone who stays calm and doesn't snap"}}
 
 Only output the JSON object. No explanation, no markdown.`;
 const READINESS_SYSTEM=`Task: the person has already said they want to work on or change something. Read a short chat and decide how ready they seem to actually do it, right now.
@@ -464,7 +473,7 @@ async function classifyFocus(latestUserText){
     const parsed=safeParseJSON(raw);
     if(parsed&&typeof parsed.core_focus==="string")return parsed;
   }catch(e){console.error("[Sukoon] focus classifier failed:",e)}
-  return{stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false};
+  return{stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false,tension:null};
 }
 async function classifyReadiness(latestUserText){
   const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
@@ -595,13 +604,39 @@ function stageNoteFor(stage){
   }
   return"";
 }
+// TENSION: a sharper, higher-priority version of "offer a tentative read" —
+// fires only when the focus classifier's tension field is set (see FOCUS_SYSTEM),
+// which requires two things genuinely pulling against each other in the same
+// breath, not just sequential facts. Outranks plain focus-changed because it's
+// a specific instance of that same moment with real content to name — a flat
+// "that makes sense" is exactly the failure this exists to catch. Ties directly
+// to prompt.js §6's double-sided reflection, so this triggers an existing move
+// rather than introducing a new unexplained one.
+function tensionNoteFor(tension){
+  if(!tension||!tension.a||!tension.b)return"";
+  return"There's a real pull between two things here: "+tension.a+" — but also "+tension.b+". Name that tension directly this turn as a double-sided reflection (see section 6) — don't just validate one side of it, and don't ask another question yet.";
+}
+// DIRECT ASK: catches "how can you help me" / "what should I do" style asks —
+// prompt.js §30 already says to answer these directly, but that static rule
+// was losing to whatever dynamic note the arbiter picked (e.g. a readiness
+// brake saying "don't suggest yet"). This makes the override explicit and
+// puts it at the top of the move priority, instead of relying on a landing
+// timer happening to coincide with the turn someone actually asked.
+const DIRECT_HELP_PATTERN=/how can you help|what should i do|what do you think i should do|any suggestions|any advice|what would you do|can you help me|help me figure|what can i do/i;
+function looksLikeDirectHelpAsk(text){return DIRECT_HELP_PATTERN.test(normalise(text))}
+function directAskNoteFor(){
+  return"They just directly asked for help or what to do. Answer practically and briefly this turn (see section 30) — don't respond with another reflection question, and don't hold back a concrete idea just because readiness looked early; asking directly like this is itself a sign they're ready to hear one.";
+}
 // The arbiter: picks exactly ONE "what to do this turn" directive by priority,
 // instead of concatenating every note that happens to be non-empty. Scope/audit
 // guardrails are a different category (constraints, not competing moves) so
 // they're always passed through alongside whichever single move note wins.
-function buildArbiterNote({scopeGuardrail,pendingSteeringNote,maxReachedNote,thinReplyNote,focusChangedNote,ventCheckNote,otherStateNote,readinessNote,stageDefaultNote}){
+// tensionNote sits above focusChangedNote — same underlying signal (something
+// just clarified), but tension has actual content to hand the model, so it
+// should win when both are available the same turn.
+function buildArbiterNote({scopeGuardrail,pendingSteeringNote,directAskNote,maxReachedNote,thinReplyNote,tensionNote,focusChangedNote,ventCheckNote,otherStateNote,readinessNote,stageDefaultNote}){
   const guardrails=[scopeGuardrail,pendingSteeringNote].filter(Boolean).join(" ");
-  const moveNote=maxReachedNote||thinReplyNote||focusChangedNote||ventCheckNote||otherStateNote||readinessNote||stageDefaultNote||"";
+  const moveNote=directAskNote||maxReachedNote||thinReplyNote||tensionNote||focusChangedNote||ventCheckNote||otherStateNote||readinessNote||stageDefaultNote||"";
   return[guardrails,moveNote].filter(Boolean).join(" ");
 }
 function readinessNoteFor(stage){
@@ -769,7 +804,7 @@ if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content
 // (or cost anything) for purely validation-mode conversations.
 const wantsReadiness=goalMode==="wants_change";
 const [cls,focusResult,readinessResult]=opts.skipClassify
-  ?[{risk:"none",scope:"in_scope"},{stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false},readinessStage]
+  ?[{risk:"none",scope:"in_scope"},{stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false,tension:null},readinessStage]
   :await Promise.all([classify(text),classifyFocus(text),wantsReadiness?classifyReadiness(text):Promise.resolve(readinessStage)]);
 if(cls.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
 readinessStage=readinessResult;
@@ -785,17 +820,21 @@ const readinessNote=wantsReadiness?readinessNoteFor(readinessStage):"";
 const maxReachedNote=maxReachedNoteFor();
 const thinReplyNote=thinReplyNoteFor(focusResult.stage);
 const stageDefaultNote=stageNoteFor(focusResult.stage);
+const tensionNote=tensionNoteFor(focusResult.tension);
+const directAskNote=looksLikeDirectHelpAsk(text)?directAskNoteFor():"";
 console.log("[Sukoon] focus result:",focusResult,"| goalMode:",goalMode,"| focusChangedNote:",focusChangedNote||"(empty)","| otherNote:",otherNote||"(empty)");
 console.log("[Sukoon] readiness result:",readinessResult,"| wantsReadiness:",wantsReadiness,"| readinessNote:",readinessNote||"(empty)");
-console.log("[Sukoon] maxReachedNote:",maxReachedNote||"(empty)","| thinReplyNote:",thinReplyNote||"(empty)","| thinReplyStreak:",thinReplyStreak+"/"+THIN_REPLY_STREAK_TRIGGER,"| movingStageTurnCount:",movingStageTurnCount+"/"+MAX_MOVING_TURNS,"| hypothesisRejectCount:",hypothesisRejectCount+"/"+MAX_HYPOTHESIS_REJECTIONS,"| landingForced:",landingForced);
+console.log("[Sukoon] maxReachedNote:",maxReachedNote||"(empty)","| thinReplyNote:",thinReplyNote||"(empty)","| tensionNote:",tensionNote||"(empty)","| directAskNote:",directAskNote||"(empty)","| thinReplyStreak:",thinReplyStreak+"/"+THIN_REPLY_STREAK_TRIGGER,"| movingStageTurnCount:",movingStageTurnCount+"/"+MAX_MOVING_TURNS,"| hypothesisRejectCount:",hypothesisRejectCount+"/"+MAX_HYPOTHESIS_REJECTIONS,"| landingForced:",landingForced);
 // The arbiter — see buildArbiterNote() above. Picks exactly ONE "what to do
 // this turn" move directive by priority instead of concatenating every note
 // that happens to be non-empty; scope/audit guardrails still always pass through.
 const contextNote=buildArbiterNote({
   scopeGuardrail:scopeDirectiveFor(cls),
   pendingSteeringNote,
+  directAskNote,
   maxReachedNote,
   thinReplyNote,
+  tensionNote,
   focusChangedNote,
   ventCheckNote,
   otherStateNote:otherNote,
