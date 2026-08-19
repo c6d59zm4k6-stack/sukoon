@@ -316,7 +316,14 @@ function addBubble(role,text,chipActivity,quickReplies){const row=document.creat
 // dependence on the model reliably following a delimiter instruction — same
 // reasoning as why deterministicChecks() is regex, not a model judgment.
 // Overflow beyond the cap is merged into the last bubble, never dropped.
-const BUBBLE_SPLIT_MAX=3,BUBBLE_STAGGER_MS=450;
+const BUBBLE_SPLIT_MAX=3;
+// Delay scales with the NEXT bubble's length — a short "wait, really?" pops
+// up fast, a longer follow-up takes a beat longer, roughly mimicking typing
+// pace rather than a flat pause. Capped so a long chunk doesn't feel sluggish.
+const BUBBLE_STAGGER_BASE_MS=700,BUBBLE_STAGGER_PER_WORD_MS=90,BUBBLE_STAGGER_MAX_MS=2200;
+function bubbleStaggerDelay(nextPartText){
+  return Math.min(BUBBLE_STAGGER_MAX_MS,BUBBLE_STAGGER_BASE_MS+wordCount(nextPartText)*BUBBLE_STAGGER_PER_WORD_MS);
+}
 function splitIntoBubbles(text){
   let parts=(text||"").split(/\n\s*\n/).map(p=>p.trim()).filter(Boolean);
   if(!parts.length)parts=[(text||"").trim()];
@@ -335,7 +342,7 @@ async function addBubbleSequence(role,text,chipActivity,quickReplies){
   const parts=splitIntoBubbles(text);
   let lastRow=null;
   for(let i=0;i<parts.length;i++){
-    if(i>0){addTyping();await sleep(BUBBLE_STAGGER_MS);removeTyping()}
+    if(i>0){addTyping();await sleep(bubbleStaggerDelay(parts[i]));removeTyping()}
     const isLast=i===parts.length-1;
     lastRow=addBubble(role,parts[i],isLast?chipActivity:null,isLast?quickReplies:null);
   }
@@ -480,16 +487,32 @@ function buildStateNote(focusResult){
     focusChangedNote="FOCUS just changed to: "+focusResult.core_focus+". Check in on this, in your own words, before moving on to anything else — this takes priority over whatever you were about to ask next.";
   }
   conversationFocus=focusResult.core_focus||conversationFocus;
-  if(focusResult.focus_changed){
-    // Genuine topic shift — everything gated on "how long have we been on
-    // this" restarts, including the new max-cap and thin-reply counters.
+  // Before a goal is locked in, a focus change can genuinely be a new topic —
+  // full reset, including focusStableTurns. Once goalMode is "wants_change"
+  // or "validation_only", a focus change is usually the SAME thread getting
+  // more specific — e.g. "parent shouting" -> "should have shouted back" ->
+  // "telling them to take the kid home" is one story deepening, not three
+  // topics — so focusStableTurns must keep accumulating THROUGH deepening
+  // turns too, not just avoid wiping depthPushed/landingOffered, or the
+  // >=3 threshold that sets depthPushed in the first place can never be
+  // reached in a conversation that keeps deepening (confirmed by replaying
+  // a real transcript against this logic before landing on this fix).
+  if(focusResult.focus_changed&&(goalMode===null||goalMode==="pending")){
     focusStableTurns=0;depthPushed=false;landingOffered=false;turnsSinceDepthPush=0;
-    movingStageTurnCount=0;hypothesisRejectCount=0;landingForced=false;thinReplyStreak=0;
+    hypothesisRejectCount=0;landingForced=false;
   }else{
     focusStableTurns++;
-    if(focusResult.stage==="moving")movingStageTurnCount++;
   }
-  if(goalMode==="validation_only"&&depthPushed&&!landingOffered)turnsSinceDepthPush++;
+  // movingStageTurnCount/thinReplyStreak are different: they measure
+  // stagnation on the CURRENT exact framing (the max-cap safety net), not
+  // overall thread progress — deepening IS progress, so it's correct for
+  // these two specifically to restart on any focus change, locked or not.
+  if(focusResult.focus_changed){
+    movingStageTurnCount=0;thinReplyStreak=0;
+  }else if(focusResult.stage==="moving"){
+    movingStageTurnCount++;
+  }
+  if((goalMode==="validation_only"||goalMode==="wants_change")&&depthPushed&&!landingOffered)turnsSinceDepthPush++;
   if(goalMode==="pending"){
     // Last turn we asked "work on it, or just wanted to get it out?" — this
     // turn's message is their answer, read via the same wants_change field
@@ -523,6 +546,15 @@ function buildStateNote(focusResult){
     // hand them the choice — keep talking, try something small to release
     // it, or pause and come back later. Options, not a prescription.
     otherNote="They've had space to sit with this. Offer a natural landing: name what they seem to be feeling, then invite them to either keep sharing anything else on their mind, or gently suggest something small that might help release the feeling right now — like a short walk, a minute of slow breathing, or music (ask what usually helps them rather than prescribing one thing) — or offer to pause here and pick this back up later. Let them choose; don't push any one option.";
+    landingOffered=true;
+  }else if(goalMode==="wants_change"&&depthPushed&&!landingOffered&&turnsSinceDepthPush>=2){
+    // Mirror of the validation_only landing above, for wants_change instead:
+    // bring it together and check in on direction, rather than continuing to
+    // explore indefinitely. A concrete idea can be part of this, but framed
+    // as one option among a real choice, not a directive — readinessNoteFor's
+    // gate still applies underneath this (see prompt.js §31 for how a
+    // suggestion, if offered, should be framed as a hypothesis to test).
+    otherNote="They've had space to explore this. Bring it together: briefly name the pattern or tension you've picked up on, then check in on direction — ask if they want to explore further, try something small based on what's come up, or wind down for now. If a concrete idea comes to mind, offer it as one option among the choices, not a directive.";
     landingOffered=true;
   }
   return{focusChangedNote,otherNote};
@@ -662,6 +694,15 @@ function maybeAttachQuickReplies(row,replyText,myGeneration){
 // reflection?) — exactly where a 9B model is unreliable. Those get deferred:
 // let the reply through, queue a follow-up check with the higher-cost model.
 const COMPLEX_EVALUATOR_ISSUES=new Set(["unsolicited_advice","low_empathy","unearned_complex_reflection","diagnosis_language","parasocial_overclaim","fabricated_detail"]);
+// unsolicited_advice is judged by this same audit call (still "the main
+// model," via callGroq's default of whatever's selected) but deliberately
+// does NOT feed a steering note back in — see prompt.js §31. Whether a
+// suggestion was appropriate is now the prompt's call (offer it as a
+// hypothesis to test, one at a time, drop it on pushback) rather than a
+// runtime correction, since this flag can't reliably tell a legitimate
+// tentative suggestion apart from an actual command. Confirmed flags are
+// still logged here for review — just not acted on turn-to-turn.
+const REVIEW_ONLY_ISSUES=new Set(["unsolicited_advice"]);
 let pendingSteeringNote="";
 async function auditComplexFlag(userText,replyText,issue){
   try{
@@ -671,8 +712,12 @@ async function auditComplexFlag(userText,replyText,issue){
     const raw=await callGroq(AUDIT_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+replyText+"\n\nQwen 9B flagged this reply for: "+issue}],"evaluator_audit");
     const parsed=safeParseJSON(raw);
     if(parsed&&parsed.pass===false&&parsed.issue===issue){
-      pendingSteeringNote="Your previous reply was flagged for "+issue+" on a closer look — this turn, deliberately avoid repeating that pattern.";
-      console.log("[Sukoon] complex-flag CONFIRMED by high-cost audit:",issue);
+      if(REVIEW_ONLY_ISSUES.has(issue)){
+        console.log("[Sukoon] complex-flag CONFIRMED (review-only, no steering — governed by prompt instead):",issue);
+      }else{
+        pendingSteeringNote="Your previous reply was flagged for "+issue+" on a closer look — this turn, deliberately avoid repeating that pattern.";
+        console.log("[Sukoon] complex-flag CONFIRMED by high-cost audit:",issue);
+      }
     }else{
       console.log("[Sukoon] complex-flag was a false positive from the cheap evaluator:",issue);
     }
