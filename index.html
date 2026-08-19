@@ -405,7 +405,9 @@ focus_changed: true ONLY if the newest message reveals something MORE central th
 
 wants_change: true ONLY if they directly and unmistakably said they want to change, fix, stop, or improve the core_focus itself ("I want to stop doing this"). False if only describing or reacting to it, even with frustration.
 
-tension: null almost always. Only set it when the person's own words show two things genuinely pulling against each other AT THE SAME TIME - not two separate facts said one after another, not a past-vs-present contrast, an actual internal pull ("part of me wanted X, but I also didn't want Y"). Each side is a short phrase in their terms. Do not manufacture a tension merely to sound insightful - if you are not sure it is really there, output null.
+tension: null almost always. Only set it when the person's own words show two things genuinely pulling against each other AT THE SAME TIME - not two separate facts said one after another, not a past-vs-present contrast, an actual internal pull ("part of me wanted X, but I also didn't want Y"). Each side is a short phrase in their terms.
+
+Test before setting it: could both things be true or done AT THE SAME TIME without contradicting each other? If yes - e.g. they did two things together as one coordinated response, like staying calm WHILE also speaking up - that is NOT tension, that's just two actions in the same effort. Tension requires the two things to actually pull against each other, not sit comfortably side by side. Do not manufacture a tension merely to sound insightful - if you are not sure it is really there, output null.
 
 You get the previous focus you reported last turn. Keep it unless the new message clearly points somewhere more central.
 
@@ -429,6 +431,12 @@ user: should I have said something back to him
 assistant: what stopped you?
 user: I try to stay professional, I don't want to be the kind of person who snaps at people
 Output: {"stage":"moving","core_focus":"staying professional under provocation","focus_changed":false,"wants_change":false,"tension":{"a":"wanting to have stood up for himself in the moment","b":"valuing being someone who stays calm and doesn't snap"}}
+
+Example D (NOT tension - a common mistake to avoid):
+Previous focus: handling someone shouting at them
+user: I tried taking deep breaths and kept telling them their problem is resolvable and that shouting is rude, we don't talk like that
+Output: {"stage":"moving","core_focus":"staying calm while confronting rude shouting","focus_changed":false,"wants_change":false,"tension":null}
+(Staying calm and naming the behavior as rude were done TOGETHER, as one coordinated response - not two things pulling against each other. This is not tension even though two things are mentioned.)
 
 Only output the JSON object. No explanation, no markdown.`;
 const READINESS_SYSTEM=`Task: the person has already said they want to work on or change something. Read a short chat and decide how ready they seem to actually do it, right now.
@@ -622,7 +630,28 @@ function tensionNoteFor(tension){
 // brake saying "don't suggest yet"). This makes the override explicit and
 // puts it at the top of the move priority, instead of relying on a landing
 // timer happening to coincide with the turn someone actually asked.
-const DIRECT_HELP_PATTERN=/how can you help|what should i do|what do you think i should do|any suggestions|any advice|what would you do|can you help me|help me figure|what can i do/i;
+// Broadened past the first transcript's exact phrasing — real direct-help
+// asks come in many shapes: "how should I stop this", "what's the best way
+// to...", "got any tips", "is there anything I can do", etc. Grouped by
+// pattern type below rather than one flat phrase list, so new variants are
+// easier to slot into the right group instead of growing one long line.
+const DIRECT_HELP_PATTERN=new RegExp([
+  // "how/what should|do|can|would I|you <handle-type verb>" — stop, handle,
+  // deal with, fix, prevent, approach, respond, cope, or "get/make X stop"
+  "\\bhow (?:should|do|can|would) (?:i|you) (?:stop|handle|deal with|prevent|fix|approach|respond to|manage|cope with|get (?:this|that|it|them) to stop|make (?:this|that|it) stop)\\b",
+  "\\bwhat (?:should|can) i do\\b",
+  "\\bwhat do you think i should do\\b",
+  "\\bwhat would you do\\b",
+  "\\bwhat(?:'s| is) the best way to\\b",
+  "\\b(?:can|could) you help(?: me)?\\b",
+  "\\bhelp me (?:figure|with|out)\\b",
+  "\\bhow can you help\\b",
+  "\\bany (?:suggestions|advice|tips|ideas)\\b",
+  "\\bgot any (?:ideas|suggestions|tips)\\b",
+  "\\bwhat do you suggest\\b",
+  "\\bis there anything i can do\\b",
+  "\\bhow do you (?:deal with|handle) (?:this|that)\\b"
+].join("|"),"i");
 function looksLikeDirectHelpAsk(text){return DIRECT_HELP_PATTERN.test(normalise(text))}
 function directAskNoteFor(){
   return"They just directly asked for help or what to do. Answer practically and briefly this turn (see section 30) — don't respond with another reflection question, and don't hold back a concrete idea just because readiness looked early; asking directly like this is itself a sign they're ready to hear one.";
