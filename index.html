@@ -376,7 +376,12 @@ function addQuickRepliesOnly(quickReplies){
   wrap.className="quick-replies";
   wrap.style.justifyContent="center";
   wrap.style.maxWidth="100%";
-  quickReplies.slice(0,3).forEach(qr=>{
+  // No slice(0,3) here, unlike buildQuickReplyChips below — that cap exists
+  // because THAT function also renders AI-generated quick replies, which
+  // QUICK_REPLY_SYSTEM is asked for "up to 3" of and can't be trusted to
+  // always honor. This function only ever renders our own hardcoded starter
+  // list (currently 4 items) — nothing to guard against, so nothing to cut.
+  quickReplies.forEach(qr=>{
     if(!qr||!qr.trim())return;
     const btn=document.createElement("button");
     btn.type="button";
