@@ -445,6 +445,12 @@ user: I tried taking deep breaths and kept telling them their problem is resolva
 Output: {"stage":"moving","core_focus":"staying calm while confronting rude shouting","focus_changed":false,"wants_change":false,"tension":null}
 (Staying calm and naming the behavior as rude were done TOGETHER, as one coordinated response - not two things pulling against each other. This is not tension even though two things are mentioned.)
 
+Example E (NOT focus change - a common mistake to avoid):
+Previous focus: getting the polytech forms handed in
+user: after talking to you, I got Donna to help me out. that was helpful
+Output: {"stage":"moving","core_focus":"getting the polytech forms handed in","focus_changed":false,"wants_change":false,"tension":null}
+(Donna is an incidental detail about HOW the forms got moving, not a new central thing - the forms are still what's driving this. A passing mention of a person, place, or other detail that helped does not by itself make it the new focus. Only flip focus_changed if that detail itself is now what matters most to the person - not just background to the thing that already mattered.)
+
 Only output the JSON object. No explanation, no markdown.`;
 const READINESS_SYSTEM=`Task: the person has already said they want to work on or change something. Read a short chat and decide how ready they seem to actually do it, right now.
 
@@ -624,7 +630,7 @@ function stageNoteFor(stage){
     return"Still gathering the picture. Favor open questions and short minimal encouragers ('mm.', 'right...', 'yeah, go on.') — hold off on affirmations, there's nothing concrete to affirm yet.";
   }
   if(stage==="moving"){
-    return"Enough is on the table to work with. Default to offering a tentative read this turn (a complex reflection they can correct) rather than another plain open question — affirmation and summary are both fair game here too.";
+    return"Enough is on the table to work with. Default to offering a tentative read this turn (a complex reflection they can correct) rather than another plain open question — affirmation and summary are both fair game here too, but don't let either be the whole reply: pair it with a check-in or a next question so the turn still leads somewhere.";
   }
   return"";
 }
@@ -716,17 +722,34 @@ function scopeDirectiveFor(cls){
 }
 const EVALUATOR_RULES="Judge: no unsolicited advice unless explicitly asked; no diagnosis/clinical language; no medication/treatment recommendations; warm and validating; no unrelated tasks; no parasocial claims; no unearned complex reflection; no fabricated detail. fabricated_detail = the reply references a specific activity, object, event, or detail that the person did not actually say, even loosely — check the recent conversation provided, not just the last message. Respond ONLY JSON: {\"pass\":true|false,\"issue\":null|\"unsolicited_advice\"|\"diagnosis_language\"|\"medication_mention\"|\"low_empathy\"|\"out_of_scope\"|\"parasocial_overclaim\"|\"unearned_complex_reflection\"|\"fabricated_detail\"}";
 const EVALUATOR_SYSTEM="You are a strict output evaluator for a supportive, non-clinical AI companion reply. "+EVALUATOR_RULES;
-// Used only for the second-opinion audit call. Qwen 9B is small and over-flags
-// on anything needing real judgment — this call is deliberately told that its
-// own flag is a hint to look closely, not a verdict to rubber-stamp, since the
-// model running this audit is more capable than the one that raised the flag.
-const AUDIT_SYSTEM="You are the second, more careful review of a reply that a much smaller model (Qwen 9B) already flagged as a possible issue. Qwen 9B can only reliably catch obvious problems — on anything requiring real judgment (is this actually advice vs. a validating reflection with a question, is the empathy actually low, is a reflection actually unearned, is a detail actually fabricated, does this actually name a diagnosis, is this actually an overclaimed relationship) it produces a lot of false flags. You are more capable than it — do not treat its flag as ground truth. Judge the reply fresh, independently, using your own better judgment, and only agree with the flag if you would genuinely raise it yourself, looking at the reply cold. "+EVALUATOR_RULES;
+// Used only for the second-opinion audit call. The fast-pass evaluator is
+// tuned for speed over nuance and over-flags on anything needing real
+// judgment — this call is deliberately told that its own flag is a hint to
+// look closely, not a verdict to rubber-stamp, since the model running this
+// audit is the higher-cost one, chosen for care over latency.
+const AUDIT_SYSTEM="You are the second, more careful review of a reply that a faster, first-pass evaluator already flagged as a possible issue. That first pass is tuned for speed and can only reliably catch obvious problems — on anything requiring real judgment (is this actually advice vs. a validating reflection with a question, is the empathy actually low, is a reflection actually unearned, is a detail actually fabricated, does this actually name a diagnosis, is this actually an overclaimed relationship) it produces a lot of false flags. Do not treat its flag as ground truth. Judge the reply fresh, independently, using your own better judgment, and only agree with the flag if you would genuinely raise it yourself, looking at the reply cold. "+EVALUATOR_RULES;
 // Independent of the dropdown — the evaluator is a fixed, cheap check regardless
 // of which model is generating the reply. Known risk, accepted deliberately: a
-// small model may pass things a stronger one would catch. The existing retry +
-// deterministic checks + fallback are the safety net if it does.
-const EVALUATOR_MODEL="qwen/qwen3.5-9b";
-async function evaluateReply(userText,draftReply){try{const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");const raw=await callGroq(EVALUATOR_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply}],"evaluator",undefined,undefined,EVALUATOR_MODEL,"none");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){}return{pass:true,issue:null}}
+// fast, low-cost model may pass things a stronger one would catch. The existing
+// retry + deterministic checks + fallback are the safety net if it does.
+// Was qwen/qwen3.5-9b via callGroq() -> /api/chat -> OpenRouter, same path as
+// every other classifier call. That path was the latency problem, not really
+// the model: OpenRouter adds a proxy hop and its own provider selection on top
+// of whatever the underlying model needs. classifyFocus/classifyReadiness
+// already proved out a faster path for exactly this kind of call — hit Groq's
+// own API directly (callGroqDirect -> /api/groq-classify), no proxy in between.
+// This call is a fixed strict-JSON judge (blocks every turn, so it's the one
+// place latency is actually felt), which makes it the same shape of task as
+// those two classifiers — moved here onto the same proven route and model.
+const EVALUATOR_MODEL="openai/gpt-oss-120b";
+async function evaluateReply(userText,draftReply){try{const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");const userContent="Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+draftReply;
+  // 800, not the old 120-token budget: gpt-oss on Groq spends reasoning tokens
+  // out of the same max_tokens budget, and a too-tight cap was seen truncating
+  // the focus classifier's JSON mid-object for exactly this reason (see
+  // FOCUS_SYSTEM's call above) — same model, same risk, same fix. reasoning
+  // effort pinned to "low" so it doesn't default to spending more time/tokens
+  // thinking than this pass/fail judgment call needs.
+  const raw=await callGroqDirect(EVALUATOR_SYSTEM,userContent,EVALUATOR_MODEL,"low",800,"evaluator");const parsed=safeParseJSON(raw);if(parsed&&typeof parsed.pass==="boolean")return parsed}catch(e){console.error("[Sukoon] evaluator failed:",e)}return{pass:true,issue:null}}
 // Quick replies are their own small, cheap, JSON-mode call now — separated out
 // so the main call has nothing left to forget (no REPLY: *and* QUICK_REPLIES:
 // competing for its attention). Fired only when it's actually worth asking, and
@@ -774,13 +797,15 @@ function maybeAttachQuickReplies(row,replyText,myGeneration){
     quickReplyStreak=appendQuickReplies(row,list)?quickReplyStreak+1:0;
   });
 }
-// Qwen 9B is small enough that only near-keyword-level checks are reliable —
-// medication_mention and out_of_scope are close to topic detection, so they
-// still block and retry immediately. Everything else needs real interpretive
-// judgment (is this actually a diagnosis-adjacent claim, a fabricated detail,
-// an overclaimed relationship, unsolicited advice, low empathy, an unearned
-// reflection?) — exactly where a 9B model is unreliable. Those get deferred:
-// let the reply through, queue a follow-up check with the higher-cost model.
+// The fast-pass evaluator is tuned for speed, not nuance, so only near-
+// keyword-level checks are reliable from it — medication_mention and
+// out_of_scope are close to topic detection, so they still block and retry
+// immediately. Everything else needs real interpretive judgment (is this
+// actually a diagnosis-adjacent claim, a fabricated detail, an overclaimed
+// relationship, unsolicited advice, low empathy, an unearned reflection?) —
+// exactly where a fast pass is unreliable regardless of which model runs it.
+// Those get deferred: let the reply through, queue a follow-up check with
+// the higher-cost model.
 const COMPLEX_EVALUATOR_ISSUES=new Set(["unsolicited_advice","low_empathy","unearned_complex_reflection","diagnosis_language","parasocial_overclaim","fabricated_detail"]);
 // unsolicited_advice is judged by this same audit call (still "the main
 // model," via callGroq's default of whatever's selected) but deliberately
@@ -797,7 +822,7 @@ async function auditComplexFlag(userText,replyText,issue){
     const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
     // No model override here — deliberately uses whatever's selected (the
     // higher-cost model), since this is the second opinion, not the fast pass.
-    const raw=await callGroq(AUDIT_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+replyText+"\n\nQwen 9B flagged this reply for: "+issue}],"evaluator_audit");
+    const raw=await callGroq(AUDIT_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nUser's last message:\n"+userText+"\n\nDraft reply:\n"+replyText+"\n\nThe fast-pass evaluator flagged this reply for: "+issue}],"evaluator_audit");
     const parsed=safeParseJSON(raw);
     if(parsed&&parsed.pass===false&&parsed.issue===issue){
       if(REVIEW_ONLY_ISSUES.has(issue)){
@@ -921,7 +946,7 @@ const debugOverlay=document.getElementById("debug-overlay"),debugBody=document.g
 function metricRow(label,value,key,isPct){let display="—",statusClass="na",statusText="no data";if(value!==null&&value!==undefined){display=isPct?(value*100).toFixed(0)+"%":value.toFixed(2);statusText=bandStatus(key,value);statusClass=statusText==="in band"?"ok":"off"}const cfg=MI_TARGETS[key],targetDisp=isPct?(cfg.target*100).toFixed(0)+"%":cfg.target.toFixed(2);return"<div class='metric-row'><span>"+label+"<br><span style='font-size:.7rem;color:var(--ink-soft)'>target "+targetDisp+" ±"+(cfg.tolerance*100)+"%</span></span><span><span class='val'>"+display+"</span><span class='status "+statusClass+"'>"+statusText+"</span></span></div>"}
 function renderDebugPanel(){const s=computeMetrics(sessionTally),a=computeMetrics(aggregateTally);debugBody.innerHTML="<div class='metric-block'><h4>This session ("+s.turns+" coded turns)</h4>"+metricRow("Reflection : Question",s.rq_ratio,"rq_ratio",false)+metricRow("Open questions",s.pct_open,"pct_open",true)+metricRow("Complex reflections",s.pct_complex,"pct_complex",true)+"<div class='metric-row'><span>Advice given</span><span class='val'>"+s.advice+"</span></div><p class='metric-note'>Steering starts after "+MIN_CODED_TURNS_BEFORE_STEERING+" coded turns.</p></div><div class='metric-block'><h4>All-time ("+a.turns+" turns)</h4><div class='metric-row'><span>Reflection : Question</span><span class='val'>"+(a.rq_ratio===null?"—":a.rq_ratio.toFixed(2))+"</span></div><div class='metric-row'><span>Open questions</span><span class='val'>"+(a.pct_open===null?"—":(a.pct_open*100).toFixed(0)+"%")+"</span></div><div class='metric-row'><span>Complex reflections</span><span class='val'>"+(a.pct_complex===null?"—":(a.pct_complex*100).toFixed(0)+"%")+"</span></div><div class='metric-row'><span>Advice given</span><span class='val'>"+a.advice+"</span></div></div><div class='metric-block'><h4>Raw counts (session)</h4><div class='metric-row'><span>Simple reflections</span><span class='val'>"+sessionTally.simple_reflection+"</span></div><div class='metric-row'><span>Complex reflections</span><span class='val'>"+sessionTally.complex_reflection+"</span></div><div class='metric-row'><span>Open questions</span><span class='val'>"+sessionTally.open_question+"</span></div><div class='metric-row'><span>Closed questions</span><span class='val'>"+sessionTally.closed_question+"</span></div><div class='metric-row'><span>Other</span><span class='val'>"+sessionTally.other+"</span></div></div>"}
 let orbTaps=0,orbTapTimer=null;document.getElementById("mascot-avatar").addEventListener("click",()=>{orbTaps++;clearTimeout(orbTapTimer);orbTapTimer=setTimeout(()=>{orbTaps=0},1200);if(orbTaps>=5){orbTaps=0;renderDebugPanel();debugOverlay.classList.add("open")}});document.getElementById("close-debug-btn").addEventListener("click",()=>debugOverlay.classList.remove("open"));document.getElementById("reset-agg-btn").addEventListener("click",resetAggregate);
-(async function init(){memoryEnabled=await loadMemoryEnabled();memoryFacts=memoryEnabled?await loadMemory():[];await loadAggregate();aggregateSessions++;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:aggregateSessions}))}catch(e){}if(memoryFacts.length)addBubble("assistant","Hi again — glad you're back. Last time, "+memoryFacts[0].toLowerCase().replace(/\.$/,"")+" came up. Want to pick up from there, or start fresh?",null,["Pick up from there","Let's start fresh"]);else addQuickRepliesOnly(["Just want to vent","Something specific happened","Not sure, just checking in"])})();
+(async function init(){memoryEnabled=await loadMemoryEnabled();memoryFacts=memoryEnabled?await loadMemory():[];await loadAggregate();aggregateSessions++;try{localStorage.setItem("sukoon_mi_aggregate",JSON.stringify({tally:aggregateTally,sessions:aggregateSessions}))}catch(e){}if(memoryFacts.length)addBubble("assistant","Hi again — glad you're back. Last time, "+memoryFacts[0].toLowerCase().replace(/\.$/,"")+" came up. Want to pick up from there, or start fresh?",null,["Pick up from there","Let's start fresh"]);else addQuickRepliesOnly(["Specific question","Change a habit","Want to vent","Something else on my mind"])})();
 </script>
 </body>
 </html>
