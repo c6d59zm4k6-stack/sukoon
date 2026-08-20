@@ -95,7 +95,7 @@
 <div class="modal-overlay" id="debug-overlay"><div class="modal"><h2>MI fidelity (internal)</h2><p class="sub">Hidden diagnostic view — not shown to users. Opened by tapping the orb 5 times.</p><div id="debug-body"></div><div class="modal-actions"><button class="btn btn-danger" id="reset-agg-btn" type="button">Reset all-time</button><button class="btn btn-primary" id="close-debug-btn" type="button">Close</button></div></div></div>
 </div>
 <script type="module">
-import { buildConversationPrompt } from "./conversation/prompt.js";
+import { buildConversationPrompt, SPECIFIC_QUESTION_SYSTEM_PROMPT } from "./conversation/prompt.js";
 // Editable via the header dropdown; persisted in localStorage so it survives reloads.
 // Every model here is called through OpenRouter with the same request shape, so
 // swapping models is just picking a different slug — no other code changes needed.
@@ -294,6 +294,10 @@ let initialIntent=null;
 let ventCheckInDone=false;
 const VENT_PATTERNS=["just want to vent","just wanted to vent","just needed to vent","want to vent","wanted to vent"];
 const VENT_CHECKIN_AT_TURN=6;
+// Matches the "Specific question" starter chip. Deliberately just the chip
+// text, not a fuzzy phrase list like VENT_PATTERNS — this is a mode select,
+// not something inferred from free-form wording.
+const SPECIFIC_QUESTION_PATTERNS=["specific question"];
 const chatEl=document.getElementById("chat"),composer=document.getElementById("composer"),sendBtn=document.getElementById("send-btn"),helpBtn=document.getElementById("help-btn"),memoryBtn=document.getElementById("memory-btn"),memoryOverlay=document.getElementById("memory-overlay"),memoryListEl=document.getElementById("memory-list"),memoryToggle=document.getElementById("memory-toggle"),forgetBtn=document.getElementById("forget-btn"),closeMemoryBtn=document.getElementById("close-memory-btn"),moreBtn=document.getElementById("more-btn"),morePanel=document.getElementById("more-panel");
 const modelSelectEl=document.getElementById("model-select");
 MODEL_OPTIONS.forEach(m=>{const opt=document.createElement("option");opt.value=m.id;opt.textContent=m.label;modelSelectEl.appendChild(opt)});
@@ -755,7 +759,12 @@ async function evaluateReply(userText,draftReply){try{const recentContext=histor
 // competing for its attention). Fired only when it's actually worth asking, and
 // never allowed to delay or reshape the main reply, which is already on screen
 // by the time this resolves.
-const QUICK_REPLY_MODEL="qwen/qwen3.5-9b";
+// Same latency fix as EVALUATOR_MODEL above: was qwen/qwen3.5-9b via callGroq()
+// -> /api/chat -> OpenRouter. Moved to the same direct-Groq route + model.
+// This one is even more latency-sensitive than the evaluator — it's racing
+// QUICK_REPLY_STALE_MS (1000ms) against a reply that's already on screen, so
+// every millisecond saved directly means fewer chips silently discarded as stale.
+const QUICK_REPLY_MODEL="openai/gpt-oss-120b";
 const QUICK_REPLY_SYSTEM="Given a supportive companion's reply and recent context, suggest up to 3 short quick-reply button options the user could tap to answer — a few words each, answers only, never questions. If nothing fits well, return an empty list. Respond ONLY JSON: {\"quick_replies\":[\"...\",\"...\"]}";
 // Chips are dropped if this call takes longer than the main reply has already
 // been on screen — a button popping in late reads as broken, not helpful.
@@ -773,7 +782,11 @@ function shouldOfferQuickReplies(replyText){
 async function fetchQuickReplies(replyText){
   const recentContext=history.slice(-6).map(m=>m.role+": "+m.content).join("\n");
   try{
-    const raw=await callGroq(QUICK_REPLY_SYSTEM,[{role:"user",content:"Recent conversation:\n"+recentContext+"\n\nCompanion's reply:\n"+replyText}],"quick_replies",undefined,undefined,QUICK_REPLY_MODEL,"none");
+    // 300, not the old 80-token budget — same gpt-oss-on-Groq reasoning-token
+    // headroom issue as the evaluator and focus classifier. Small since the
+    // output itself is tiny (up to 3 short strings), just enough slack for
+    // reasoning tokens not to truncate it. reasoning_effort "low" for speed.
+    const raw=await callGroqDirect(QUICK_REPLY_SYSTEM,"Recent conversation:\n"+recentContext+"\n\nCompanion's reply:\n"+replyText,QUICK_REPLY_MODEL,"low",300,"quick_replies");
     const parsed=safeParseJSON(raw);
     if(parsed&&Array.isArray(parsed.quick_replies))return parsed.quick_replies.filter(qr=>qr&&qr.trim()).slice(0,3);
   }catch(e){}
@@ -858,7 +871,13 @@ function buildCanonicalSystemPrompt(contextNote){
   });
 }
 async function sendMessage(text,opts){opts=opts||{};if(!text||!text.trim())return;const myGeneration=++replyGeneration;document.querySelector(".app").classList.add("compact");clearQuickReplyChips();composer.value="";composer.style.height="auto";addBubble("user",text);history.push({role:"user",content:text});userTurnCount++;
-if(userTurnCount===1){const n=normalise(text);if(VENT_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="vent"}
+if(userTurnCount===1){const n=normalise(text);if(VENT_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="vent";else if(SPECIFIC_QUESTION_PATTERNS.some(p=>n.includes(normalise(p))))initialIntent="specific_question"}
+// Once set on turn 1, this holds for the whole session — a specific-question
+// conversation stays a specific-question conversation. isDirectQA gates every
+// piece of the MI state machine below: no focus/readiness classifiers, no
+// arbiter notes, no stage/goal/landing tracking. Safety checks (crisis,
+// evaluator) still run — this skips steering, not safety.
+const isDirectQA=initialIntent==="specific_question";
 // --- Deterministic, synchronous tracking (no AI) against THIS user message,
 // using signals recorded from the PREVIOUS assistant turn. Both feed the
 // arbiter below; neither adds a network call or latency. ---
@@ -883,7 +902,9 @@ if(isCrisisMessage(text)){addCrisisCard();history.push({role:"assistant",content
 const wantsReadiness=goalMode==="wants_change";
 const [cls,focusResult,readinessResult]=opts.skipClassify
   ?[{risk:"none",scope:"in_scope"},{stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false,tension:null},readinessStage]
-  :await Promise.all([classify(text),classifyFocus(text),wantsReadiness?classifyReadiness(text):Promise.resolve(readinessStage)]);
+  :isDirectQA
+    ?await Promise.all([classify(text),Promise.resolve({stage:"understanding",core_focus:conversationFocus,focus_changed:false,wants_change:false,tension:null}),Promise.resolve(readinessStage)])
+    :await Promise.all([classify(text),classifyFocus(text),wantsReadiness?classifyReadiness(text):Promise.resolve(readinessStage)]);
 if(cls.risk==="crisis"){removeTyping();addCrisisCard();history.push({role:"assistant",content:"[Sukoon showed crisis support resources.]"});sendBtn.disabled=false;return}
 readinessStage=readinessResult;
 let ventCheckNote="";
@@ -893,20 +914,25 @@ if(initialIntent==="vent"&&!ventCheckInDone&&userTurnCount>=VENT_CHECKIN_AT_TURN
 }
 // buildStateNote() also advances focusStableTurns/movingStageTurnCount/goalMode
 // as a side effect — must run before the notes below that read those values.
-const{focusChangedNote,otherNote}=buildStateNote(focusResult);
-const readinessNote=wantsReadiness?readinessNoteFor(readinessStage):"";
-const maxReachedNote=maxReachedNoteFor();
-const thinReplyNote=thinReplyNoteFor(focusResult.stage);
-const stageDefaultNote=stageNoteFor(focusResult.stage);
-const tensionNote=tensionNoteFor(focusResult.tension);
-const directAskNote=looksLikeDirectHelpAsk(text)?directAskNoteFor():"";
+// Skipped entirely for direct-QA: nothing about this mode should feed the
+// state machine, and calling it on the stub focusResult would still tick
+// focusStableTurns forward for no reason.
+const{focusChangedNote,otherNote}=isDirectQA?{focusChangedNote:"",otherNote:""}:buildStateNote(focusResult);
+const readinessNote=(!isDirectQA&&wantsReadiness)?readinessNoteFor(readinessStage):"";
+const maxReachedNote=isDirectQA?"":maxReachedNoteFor();
+const thinReplyNote=isDirectQA?"":thinReplyNoteFor(focusResult.stage);
+const stageDefaultNote=isDirectQA?"":stageNoteFor(focusResult.stage);
+const tensionNote=isDirectQA?"":tensionNoteFor(focusResult.tension);
+const directAskNote=isDirectQA?"":(looksLikeDirectHelpAsk(text)?directAskNoteFor():"");
 console.log("[Sukoon] focus result:",focusResult,"| goalMode:",goalMode,"| focusChangedNote:",focusChangedNote||"(empty)","| otherNote:",otherNote||"(empty)");
 console.log("[Sukoon] readiness result:",readinessResult,"| wantsReadiness:",wantsReadiness,"| readinessNote:",readinessNote||"(empty)");
-console.log("[Sukoon] maxReachedNote:",maxReachedNote||"(empty)","| thinReplyNote:",thinReplyNote||"(empty)","| tensionNote:",tensionNote||"(empty)","| directAskNote:",directAskNote||"(empty)","| thinReplyStreak:",thinReplyStreak+"/"+THIN_REPLY_STREAK_TRIGGER,"| movingStageTurnCount:",movingStageTurnCount+"/"+MAX_MOVING_TURNS,"| hypothesisRejectCount:",hypothesisRejectCount+"/"+MAX_HYPOTHESIS_REJECTIONS,"| landingForced:",landingForced);
+console.log("[Sukoon] maxReachedNote:",maxReachedNote||"(empty)","| thinReplyNote:",thinReplyNote||"(empty)","| tensionNote:",tensionNote||"(empty)","| directAskNote:",directAskNote||"(empty)","| thinReplyStreak:",thinReplyStreak+"/"+THIN_REPLY_STREAK_TRIGGER,"| movingStageTurnCount:",movingStageTurnCount+"/"+MAX_MOVING_TURNS,"| hypothesisRejectCount:",hypothesisRejectCount+"/"+MAX_HYPOTHESIS_REJECTIONS,"| landingForced:",landingForced,"| isDirectQA:",isDirectQA);
 // The arbiter — see buildArbiterNote() above. Picks exactly ONE "what to do
 // this turn" move directive by priority instead of concatenating every note
 // that happens to be non-empty; scope/audit guardrails still always pass through.
-const contextNote=buildArbiterNote({
+// Skipped entirely for direct-QA — SPECIFIC_QUESTION_SYSTEM_PROMPT below
+// replaces CANONICAL_SYSTEM_PROMPT + this note for that mode, not extends it.
+const contextNote=isDirectQA?"":buildArbiterNote({
   scopeGuardrail:scopeDirectiveFor(cls),
   pendingSteeringNote,
   directAskNote,
@@ -922,18 +948,18 @@ const contextNote=buildArbiterNote({
 console.log("[Sukoon] arbiter contextNote:",contextNote||"(empty)");
 if(cls.scope==="confused_by_question")consecutiveConfusionTurns++;else consecutiveConfusionTurns=0;
 if(pendingSteeringNote)pendingSteeringNote=""; // one-shot — consumed once resolved, whichever turn that lands on
-try{const systemPrompt=buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseReplyPlain(raw);console.log("[Sukoon] parsed reply:",parsed);
-lastCandidateActivity=(cls.risk!=="elevated_distress"&&cls.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
+try{const systemPrompt=isDirectQA?SPECIFIC_QUESTION_SYSTEM_PROMPT:buildCanonicalSystemPrompt(contextNote);const windowedHistory=history.slice(-HISTORY_WINDOW);let raw=await callGroq(systemPrompt,windowedHistory,"main");console.log("[Sukoon] raw main response:",raw);let parsed=parseReplyPlain(raw);console.log("[Sukoon] parsed reply:",parsed);
+lastCandidateActivity=(!isDirectQA&&cls.risk!=="elevated_distress"&&cls.scope==="in_scope")?pickActivity(text,usedActivityIds):null;
 let evalResult=await evaluateReply(text,parsed.reply);console.log("[Sukoon] evaluator verdict:",evalResult);
 if(evalResult.pass){const det=deterministicChecks(parsed.reply,askedQuestions);if(!det.pass){console.log("[Sukoon] deterministic check failed:",det);evalResult=det}}
 else if(COMPLEX_EVALUATOR_ISSUES.has(evalResult.issue)){console.log("[Sukoon] deferring complex flag to high-cost audit instead of blocking this turn:",evalResult.issue);auditComplexFlag(text,parsed.reply,evalResult.issue);evalResult={pass:true,issue:null}}
-if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem={static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply()};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply()}}}
+if(!evalResult.pass){console.log("[Sukoon] retrying — first attempt failed on:",evalResult.issue);const repeatNote=evalResult.issue==="repeated_question"?" You already asked a very similar question earlier in this conversation — ask something NEW that builds on exactly what they just told you, do not reuse the same question.":"";const retryNote="\n\nYour previous draft failed review because: "+evalResult.issue+"."+repeatNote+" Revise it to fix that issue. Do not mention the revision.";const retrySystem=typeof systemPrompt==="string"?systemPrompt+retryNote:{static:systemPrompt.static,dynamic:(systemPrompt.dynamic||"")+retryNote};try{const retryRaw=await callGroq(retrySystem,windowedHistory,"retry");console.log("[Sukoon] raw retry response:",retryRaw);const retryParsed=parseReplyPlain(retryRaw);let retryEval=await evaluateReply(text,retryParsed.reply);if(retryEval.pass){const retryDet=deterministicChecks(retryParsed.reply,askedQuestions);if(!retryDet.pass)retryEval=retryDet}else if(COMPLEX_EVALUATOR_ISSUES.has(retryEval.issue)){console.log("[Sukoon] deferring complex flag on retry too, instead of going to fallback:",retryEval.issue);auditComplexFlag(text,retryParsed.reply,retryEval.issue);retryEval={pass:true,issue:null}}console.log("[Sukoon] retry verdict:",retryEval);parsed=retryEval.pass?retryParsed:{reply:pickFallbackReply()};if(!retryEval.pass)console.warn("[Sukoon] BOTH attempts failed — showing fallback. First issue:",evalResult.issue,"| Retry issue:",retryEval.issue)}catch(e2){console.error("[Sukoon DEBUG] retry failed:",e2);parsed={reply:pickFallbackReply()}}}
 removeTyping();let chip=null;if(lastCandidateActivity&&parsed.reply.toLowerCase().includes(lastCandidateActivity.title.toLowerCase())){chip=lastCandidateActivity;usedActivityIds.add(lastCandidateActivity.id)}const isFallback=SAFE_FALLBACK_REPLIES.includes(parsed.reply);if(!isFallback){const askedQ=extractQuestion(parsed.reply);if(askedQ)askedQuestions.push(askedQ)}
 // Set from the FINAL accepted reply (post-retry/fallback), all checks already
 // passed — feeds next turn's pushback/thin-reply tracking at the top of this
 // function. Skipped for fallback text, which isn't a real conversational move.
 if(!isFallback){pendingHypothesisCheck=looksLikeHypothesisCheck(parsed.reply);lastQuestionType=classifyQuestionTypeLocal(parsed.reply)}
-history.push({role:"assistant",content:parsed.reply});const replyRow=await addBubbleSequence("assistant",parsed.reply,chip,null);if(!isFallback){codeCompanionTurn(text,parsed.reply);maybeAttachQuickReplies(replyRow,parsed.reply,myGeneration)}else{quickReplyStreak=0}
+history.push({role:"assistant",content:parsed.reply});const replyRow=await addBubbleSequence("assistant",parsed.reply,chip,null);if(!isFallback){if(!isDirectQA)codeCompanionTurn(text,parsed.reply);maybeAttachQuickReplies(replyRow,parsed.reply,myGeneration)}else{quickReplyStreak=0}
 }catch(e){removeTyping();console.error("[Sukoon DEBUG] main flow failed:",e);const fallback=pickFallbackReply();history.push({role:"assistant",content:fallback});addBubble("assistant",fallback)}finally{sendBtn.disabled=false}
 if(userTurnCount>0&&userTurnCount%4===0)extractMemory()}
 function handleSend(){sendMessage(composer.value.trim(),{skipClassify:false})}sendBtn.addEventListener("click",handleSend);composer.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();handleSend()}});composer.addEventListener("input",()=>{composer.style.height="auto";composer.style.height=Math.min(composer.scrollHeight,110)+"px"});helpBtn.addEventListener("click",addCrisisCard);
