@@ -670,7 +670,13 @@ const DIRECT_HELP_PATTERN=new RegExp([
   "\\bis there anything i can do\\b",
   "\\bhow do you (?:deal with|handle) (?:this|that)\\b"
 ].join("|"),"i");
-function looksLikeDirectHelpAsk(text){return DIRECT_HELP_PATTERN.test(normalise(text))}
+// Excludes past-tense narration ("I got Donna to help me out", "she helped
+// me with it") from matching — those describe help already received, not a
+// request happening now, but share the literal words "help me X" with a real
+// request. Found via a live transcript where "I got Donna to help me out.
+// that was helpful" false-triggered directAskNote.
+const PAST_TENSE_HELP_PATTERN=/\b(got|asked|had|made)\b[^.?!]{0,30}\bto help me\b|\bhelped me\b/i;
+function looksLikeDirectHelpAsk(text){const n=normalise(text);if(PAST_TENSE_HELP_PATTERN.test(n))return false;return DIRECT_HELP_PATTERN.test(n)}
 function directAskNoteFor(){
   return"They just directly asked for help or what to do. Answer practically and briefly this turn (see section 30) — don't respond with another reflection question, and don't hold back a concrete idea just because readiness looked early; asking directly like this is itself a sign they're ready to hear one.";
 }
