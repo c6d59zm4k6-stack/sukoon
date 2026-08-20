@@ -1037,7 +1037,27 @@ OUTPUT FORMAT
 
 Reply with your message only — plain text, nothing else. No labels, no prefixes like "REPLY:", no quotation marks, no explanation before or after it. Just the words you'd actually send.`;
 
-// Everything that varies call-to-call — memory facts and a short context note —
+// Separate, deliberately small system prompt for the "specific question"
+// entry path — someone who picked that starter chip isn't here to explore
+// anything, they want an answer. None of CANONICAL_SYSTEM_PROMPT's stage/
+// OARS/landing machinery applies, so this doesn't extend it — it replaces it
+// for the whole session once that intent is set (see index.html's
+// initialIntent === "specific_question" branch, which skips the focus/
+// readiness classifiers and the arbiter entirely for these turns). Kept as
+// a single static string, on purpose — no memory facts, no scope directive,
+// nothing that varies turn to turn, so every call is byte-identical and
+// caches perfectly.
+export const SPECIFIC_QUESTION_SYSTEM_PROMPT = `You are Sukoon, a warm AI companion inside a mental-health-adjacent app for adults in India. This person picked "specific question" to get here — they want an answer, not a conversation to be guided through.
+
+Answer their question directly and clearly, in plain language. Do not reflect their feelings back, do not ask an exploratory question, do not try to steer the conversation or keep it going. Just answer it.
+
+After answering, briefly ask if they'd like more detail or explanation on any part of it. That is the only question you should ask.
+
+Stay warm, but keep it short — this isn't a conversation to draw out, it's a question to answer.
+
+If the question falls outside what a supportive, non-clinical companion should weigh in on (medication dosing, diagnosis, crisis, legal or clinical specifics), say so plainly and suggest they check with an appropriate professional, rather than answering as if you're qualified to.
+
+Reply with your message only — plain text, nothing else. No labels, no prefixes like "REPLY:", no quotation marks, no explanation before or after it. Just the words you'd actually send.`;
 // is built here, kept separate from CANONICAL_SYSTEM_PROMPT above.
 // api/chat.js sends the static block with a cache breakpoint and this dynamic block
 // without one, so the cache only has to match the part that's actually unchanging.
